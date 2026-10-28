@@ -43,3 +43,8 @@ data/exports/*
 data/raw/
 data/private/
 *.log
+
+# Generated Python packaging files
+*.egg-info/
+build/
+dist/
