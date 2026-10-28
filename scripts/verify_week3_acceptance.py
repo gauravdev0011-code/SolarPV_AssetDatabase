@@ -86,7 +86,7 @@ def verify_sample_import(work_dir):
             SELECT
                 a.external_id,
                 a.name AS asset_name,
-                i.inspection_key,
+                i.inspection_id,
                 i.inspected_at,
                 i.data_origin,
                 o.observation_type,
@@ -98,17 +98,16 @@ def verify_sample_import(work_dir):
             JOIN observations AS o ON o.inspection_id = i.inspection_id
             WHERE a.external_id = ?
             ORDER BY i.inspected_at, o.observation_type
-            """.replace("i.inspection_key", "i.inspection_id"),
+            """,
             ("PV-001",),
         ).fetchall()
 
-        # The current schema uses integer inspection_id, not inspection_key.
         assert len(history) == 4, (
             f"Expected four joined history rows for PV-001, got {len(history)}"
         )
         assert all(row["data_origin"] == "synthetic" for row in history)
 
-    # Re-importing byte-identical CSV files must be skipped without duplicates.
+    # Re-importing identical source files must be skipped without duplicates.
     second_result = import_data(SAMPLE_DIR, database_path)
     assert second_result["status"] == "skipped", second_result
 
@@ -242,7 +241,9 @@ def verify_transaction_rollback(work_dir):
 
 def main():
     if not SAMPLE_DIR.is_dir():
-        raise FileNotFoundError(f"Sample dataset directory not found: {SAMPLE_DIR}")
+        raise FileNotFoundError(
+            f"Sample dataset directory not found: {SAMPLE_DIR}"
+        )
 
     with tempfile.TemporaryDirectory(prefix="solarpv_acceptance_") as temp_dir:
         work_dir = Path(temp_dir)
