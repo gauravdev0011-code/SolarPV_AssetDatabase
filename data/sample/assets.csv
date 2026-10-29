@@ -1,0 +1,21 @@
+external_id,asset_type,name,description,location
+PV-001,panel,Demo Solar Panel 01,Synthetic demonstration asset; not a real research asset.,Demo Array 01
+PV-002,panel,Demo Solar Panel 02,Synthetic demonstration asset; not a real research asset.,Demo Array 01
+PV-003,panel,Demo Solar Panel 03,Synthetic demonstration asset; not a real research asset.,Demo Array 01
+PV-004,panel,Demo Solar Panel 04,Synthetic demonstration asset; not a real research asset.,Demo Array 01
+PV-005,panel,Demo Solar Panel 05,Synthetic demonstration asset; not a real research asset.,Demo Array 01
+PV-006,panel,Demo Solar Panel 06,Synthetic demonstration asset; not a real research asset.,Demo Array 02
+PV-007,panel,Demo Solar Panel 07,Synthetic demonstration asset; not a real research asset.,Demo Array 02
+PV-008,panel,Demo Solar Panel 08,Synthetic demonstration asset; not a real research asset.,Demo Array 02
+PV-009,panel,Demo Solar Panel 09,Synthetic demonstration asset; not a real research asset.,Demo Array 02
+PV-010,inverter,Demo Inverter 10,Synthetic demonstration asset; not a real research asset.,Demo Array 02
+PV-011,panel,Demo Solar Panel 11,Synthetic demonstration asset; not a real research asset.,Demo Array 03
+PV-012,panel,Demo Solar Panel 12,Synthetic demonstration asset; not a real research asset.,Demo Array 03
+PV-013,panel,Demo Solar Panel 13,Synthetic demonstration asset; not a real research asset.,Demo Array 03
+PV-014,panel,Demo Solar Panel 14,Synthetic demonstration asset; not a real research asset.,Demo Array 03
+PV-015,panel,Demo Solar Panel 15,Synthetic demonstration asset; not a real research asset.,Demo Array 03
+PV-016,panel,Demo Solar Panel 16,Synthetic demonstration asset; not a real research asset.,Demo Array 04
+PV-017,panel,Demo Solar Panel 17,Synthetic demonstration asset; not a real research asset.,Demo Array 04
+PV-018,panel,Demo Solar Panel 18,Synthetic demonstration asset; not a real research asset.,Demo Array 04
+PV-019,panel,Demo Solar Panel 19,Synthetic demonstration asset; not a real research asset.,Demo Array 04
+PV-020,inverter,Demo Inverter 20,Synthetic demonstration asset; not a real research asset.,Demo Array 04

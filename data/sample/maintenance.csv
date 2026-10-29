@@ -1,0 +1,11 @@
+asset_external_id,performed_at,maintenance_type,description,performed_by,data_origin
+PV-001,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-003,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-005,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-007,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-009,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-011,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-013,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-015,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-017,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
+PV-019,2026-10-15T10:00:00Z,visual_check,Synthetic demonstration maintenance/check record; not a real service event.,Demo Dataset Generator,synthetic
