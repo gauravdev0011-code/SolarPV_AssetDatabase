@@ -18,6 +18,7 @@ class IngestionJobState(StrEnum):
     RETRY_WAIT = "retry_wait"
     SUCCEEDED = "succeeded"
     FAILED_TERMINAL = "failed_terminal"
+    RECONCILIATION_REQUIRED = "reconciliation_required"
     CANCEL_REQUESTED = "cancel_requested"
     CANCELLED = "cancelled"
 

@@ -13,8 +13,8 @@ import solarpv_db.database as database_module
 from solarpv_db.importer import _promotion_request_fingerprint, import_data
 from solarpv_ingestion.repository import (
     ApprovalRevocationError,
-    ConcurrentStateChangeError,
     IngestionRepository,
+    JobLifecycleOwnershipError,
 )
 from solarpv_ingestion.states import (
     ApprovalState,
@@ -180,8 +180,151 @@ def test_legacy_database_migrates_without_changing_existing_rows(tmp_path):
         row = migrated.execute("SELECT external_id, name FROM assets").fetchone()
         assert (row["external_id"], row["name"]) == ("OLD-1", "Existing")
         assert migrated.execute("SELECT source_hash FROM imported_files").fetchone()[0] == "old-hash"
-        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 8
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 8
+
+
+def test_migration_007_adds_runtime_controls_without_rewriting_existing_jobs(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "phase2a-upgrade.db"
+    migration_007 = database_module.MIGRATIONS_DIR / "007_durable_intake_jobs.sql"
+    migration_dir = _copy_migrations_through(tmp_path, monkeypatch, 6)
+    initialize_database(database_path)
+    source, _ = _approved_source(tmp_path, database_path)
+    with get_connection(database_path) as connection:
+        connection.execute(
+            """INSERT INTO ingestion_jobs (
+                job_id, workspace_id, source_file_id, state, idempotency_key
+            ) VALUES ('legacy-job', 'default', 'source-1', 'queued', 'legacy-key')"""
+        )
+        before = tuple(connection.execute(
+            "SELECT job_id, workspace_id, source_file_id, state, attempt_count, idempotency_key "
+            "FROM ingestion_jobs WHERE job_id = 'legacy-job'"
+        ).fetchone())
+    (migration_dir / migration_007.name).write_text(
+        migration_007.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    initialize_database(database_path)
+
+    with get_connection(database_path) as connection:
+        after = tuple(connection.execute(
+            "SELECT job_id, workspace_id, source_file_id, state, attempt_count, idempotency_key "
+            "FROM ingestion_jobs WHERE job_id = 'legacy-job'"
+        ).fetchone())
+        assert after == before
+        assert connection.execute(
+            "SELECT COUNT(*) FROM ingestion_job_runtime"
+        ).fetchone()[0] == 0
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+
+
+def test_migration_008_adopts_legacy_job_states_without_inventing_leases(
+    tmp_path, monkeypatch
+):
+    database_path = tmp_path / "legacy-jobs.db"
+    migration_008 = database_module.MIGRATIONS_DIR / "008_intake_sessions_and_job_adoption.sql"
+    migration_dir = _copy_migrations_through(tmp_path, monkeypatch, 7)
+    initialize_database(database_path)
+    with get_connection(database_path) as connection:
+        connection.execute(
+            """INSERT INTO source_files (
+                source_file_id, workspace_id, original_name, storage_key,
+                media_type, size_bytes, sha256, state
+            ) VALUES ('legacy-source', 'default', 'legacy.csv', 'originals/legacy',
+                      'text/csv', 1, 'legacy-hash', 'available')"""
+        )
+        rows = [
+            ("legacy-queued", "queued", 1),
+            ("legacy-running", "running", 2),
+            ("legacy-succeeded", "succeeded", 1),
+            ("legacy-failed", "failed_terminal", 4),
+            ("legacy-cancelled", "cancelled", 1),
+            ("legacy-cancel-requested", "cancel_requested", 2),
+            ("legacy-retry", "retry_wait", 2),
+        ]
+        for job_id, state, attempts in rows:
+            connection.execute(
+                """INSERT INTO ingestion_jobs (
+                    job_id, workspace_id, source_file_id, state, attempt_count, idempotency_key,
+                    lease_expires_at
+                ) VALUES (?, 'default', 'legacy-source', ?, ?, ?, ?)""",
+                (job_id, state, attempts, f"key-{job_id}",
+                 "2026-01-01T00:00:00.000000Z" if state in {"running", "cancel_requested"} else None),
+            )
+        connection.execute(
+            """INSERT INTO ingestion_jobs (
+                job_id, workspace_id, source_file_id, state, attempt_count, idempotency_key
+            ) VALUES ('legacy-diverged', 'default', 'legacy-source',
+                      'failed_terminal', 5, 'key-legacy-diverged')"""
+        )
+        # Simulate a row created by a newer queue whose legacy compatibility row
+        # was subsequently changed by an older repository API.
+        connection.execute(
+            """INSERT INTO ingestion_job_runtime (job_id, attempt_count)
+               VALUES ('legacy-diverged', 0)"""
+        )
+        connection.execute(
+            """UPDATE ingestion_job_runtime SET attempt_count = 2
+               WHERE job_id = 'legacy-diverged'"""
+        )
+        connection.execute(
+            """INSERT INTO job_attempts (job_id, attempt_number, started_at)
+               VALUES ('legacy-running', 3, '2026-01-01T00:00:00Z')"""
+        )
+        connection.execute(
+            """INSERT INTO job_attempts (
+                   job_id, attempt_number, started_at, finished_at, outcome
+               ) VALUES ('legacy-succeeded', 1, '2026-01-01T00:00:00Z',
+                         '2026-01-01T00:01:00Z', 'succeeded')"""
+        )
+    (migration_dir / migration_008.name).write_text(
+        migration_008.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    initialize_database(database_path)
+
+    with get_connection(database_path) as connection:
+        migrated = connection.execute(
+            """SELECT job.job_id, job.source_file_id, job.attempt_count AS legacy_attempts,
+                      job.state AS legacy_state, runtime.state AS runtime_state,
+                      runtime.attempt_count, runtime.lease_owner, runtime.lease_token,
+                      runtime.lease_expires_at
+               FROM ingestion_jobs AS job JOIN ingestion_job_runtime AS runtime USING (job_id)
+               ORDER BY job.job_id"""
+        ).fetchall()
+        assert len(migrated) == len(rows) + 1
+        assert all(row["source_file_id"] == "legacy-source" for row in migrated)
+        mappings = {row["job_id"]: (row["runtime_state"], row["legacy_state"]) for row in migrated}
+        assert mappings == {
+            "legacy-queued": ("queued", "queued"),
+            "legacy-running": ("reconciliation_required", "failed_terminal"),
+            "legacy-succeeded": ("succeeded", "succeeded"),
+            "legacy-failed": ("failed_terminal", "failed_terminal"),
+            "legacy-cancelled": ("cancelled", "cancelled"),
+            "legacy-cancel-requested": ("reconciliation_required", "failed_terminal"),
+            "legacy-retry": ("retry_wait", "retry_wait"),
+            "legacy-diverged": ("reconciliation_required", "failed_terminal"),
+        }
+        running = next(row for row in migrated if row["job_id"] == "legacy-running")
+        assert running["attempt_count"] == running["legacy_attempts"] == 3
+        assert all(row["lease_owner"] is None and row["lease_token"] is None
+                   and row["lease_expires_at"] is None for row in migrated)
+        diverged = next(row for row in migrated if row["job_id"] == "legacy-diverged")
+        assert diverged["attempt_count"] == diverged["legacy_attempts"] == 5
+        assert connection.execute(
+            "SELECT last_error_code FROM ingestion_job_runtime "
+            "WHERE job_id = 'legacy-diverged'"
+        ).fetchone()[0] == "legacy_runtime_state_mismatch"
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+
+    # Reinitialization uses the migration ledger and must not reset live states.
+    initialize_database(database_path)
+    with get_connection(database_path) as connection:
+        assert connection.execute(
+            "SELECT state FROM ingestion_job_runtime WHERE job_id = 'legacy-running'"
+        ).fetchone()[0] == "reconciliation_required"
 
 
 def test_incompatible_untracked_schema_is_rejected_without_baseline(tmp_path):
@@ -275,18 +418,18 @@ def test_empty_migration_ledger_is_treated_as_untracked_legacy(tmp_path):
 
     with get_connection(database_path) as migrated:
         assert migrated.execute("SELECT name FROM assets WHERE external_id = 'OLD'").fetchone()[0] == "Retained"
-        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
+        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 8
 
 
-@pytest.mark.parametrize(("ledger_version", "pragma_version"), [(6, 5), (5, 6)])
+@pytest.mark.parametrize(("ledger_version", "pragma_version"), [(8, 7), (7, 8)])
 def test_migration_ledger_and_user_version_mismatch_is_rejected(
     tmp_path, ledger_version, pragma_version
 ):
     database_path = tmp_path / f"mismatch-{ledger_version}-{pragma_version}.db"
     initialize_database(database_path)
     with get_connection(database_path) as connection:
-        if ledger_version == 5:
-            connection.execute("DELETE FROM schema_migrations WHERE version = 6")
+        if ledger_version == 7:
+            connection.execute("DELETE FROM schema_migrations WHERE version = 8")
         connection.execute(f"PRAGMA user_version = {pragma_version}")
 
     with pytest.raises(RuntimeError, match="user_version does not match"):
@@ -298,9 +441,9 @@ def test_unknown_future_migration_version_is_rejected(tmp_path):
     initialize_database(database_path)
     with get_connection(database_path) as connection:
         connection.execute(
-            "INSERT INTO schema_migrations (version, name, checksum) VALUES (7, 'future', 'future')"
+            "INSERT INTO schema_migrations (version, name, checksum) VALUES (9, 'future', 'future')"
         )
-        connection.execute("PRAGMA user_version = 7")
+        connection.execute("PRAGMA user_version = 9")
 
     with pytest.raises(RuntimeError, match="newer than available"):
         initialize_database(database_path)
@@ -311,7 +454,7 @@ def test_migration_reapplication_is_idempotent(tmp_path):
     initialize_database(database_path)
     initialize_database(database_path)
     with get_connection(database_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 6
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
         assert connection.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 1
 
 
@@ -478,8 +621,8 @@ def test_concurrent_migration_initialization_is_serialized(tmp_path):
         list(executor.map(lambda _: initialize(), range(2)))
 
     with get_connection(database_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 6
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
 
 
 def test_migration_runner_ignores_trailing_sql_comments(tmp_path, monkeypatch):
@@ -590,14 +733,15 @@ def test_metadata_repositories_enforce_foreign_keys_and_state_changes(tmp_path):
         job_id="job", workspace_id="default", source_file_id="source",
         idempotency_key="job-key",
     )
-    assert repository.transition_job(job.job_id, IngestionJobState.RUNNING).state == IngestionJobState.RUNNING
+    with pytest.raises(JobLifecycleOwnershipError, match="current worker lease"):
+        repository.transition_job(job.job_id, IngestionJobState.RUNNING)
+    assert repository.get_job(job.job_id).state == IngestionJobState.QUEUED
     with pytest.raises(sqlite3.IntegrityError):
         repository.create_job(
             job_id="orphan", workspace_id="default", source_file_id="missing",
             idempotency_key="orphan-key",
         )
-    with pytest.raises(InvalidStateTransition):
-        repository.transition_job(job.job_id, IngestionJobState.QUEUED)
+    assert repository.transition_job(job.job_id, IngestionJobState.CANCELLED).state == IngestionJobState.CANCELLED
 
 
 def test_job_workspace_must_match_source_file_workspace(tmp_path):
@@ -646,32 +790,41 @@ def test_job_workspace_must_match_source_file_workspace(tmp_path):
             )
 
 
-def test_competing_repository_state_transitions_are_serialized(tmp_path):
+def test_repository_rejects_unleased_transition_and_competing_queue_claims_are_serialized(
+    tmp_path,
+):
+    from solarpv_ingestion.jobs import JobQueue
+
     database_path = tmp_path / "state-race.db"
     initialize_database(database_path)
     repository = IngestionRepository(database_path)
     repository.create_source_file(
         source_file_id="race-source", workspace_id="default", original_name="race.csv",
         storage_key="source/race", media_type="text/csv", size_bytes=1,
-        sha256="race-hash",
+        sha256="race-hash", state=SourceFileState.AVAILABLE,
     )
-    repository.create_job(
+    queue = JobQueue(database_path)
+    queue.create_job(
         job_id="race-job", workspace_id="default", source_file_id="race-source",
         idempotency_key="race-job-key",
     )
+
+    with pytest.raises(JobLifecycleOwnershipError, match="current worker lease"):
+        repository.transition_job("race-job", IngestionJobState.RUNNING)
+    assert repository.get_job("race-job").state == IngestionJobState.QUEUED
+
     barrier = Barrier(2)
 
-    def transition(target):
+    def claim(worker_id):
         barrier.wait()
-        try:
-            return repository.transition_job("race-job", target)
-        except (InvalidStateTransition, ConcurrentStateChangeError) as error:
-            return error
+        return queue.claim_next_job(worker_id)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(transition, (IngestionJobState.RUNNING, IngestionJobState.CANCELLED)))
-    assert sum(not isinstance(result, Exception) for result in results) == 1
-    assert sum(isinstance(result, Exception) for result in results) == 1
+        claims = list(executor.map(claim, ("worker-a", "worker-b")))
+    winners = [lease for lease in claims if lease is not None]
+    assert len(winners) == 1
+    assert queue.get_job("race-job").state == IngestionJobState.RUNNING
+    assert queue.get_job("race-job").attempt_count == 1
 
 
 def test_cross_record_metadata_relationships_are_enforced(tmp_path):

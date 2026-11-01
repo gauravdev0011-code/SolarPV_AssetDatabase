@@ -28,6 +28,10 @@ class ApprovalRevocationError(ValueError):
     """Raised when an approval is revoked after a promotion has started."""
 
 
+class JobLifecycleOwnershipError(ValueError):
+    """Raised when a worker-owned transition is attempted without its lease."""
+
+
 class IngestionRepository:
     """Persist foundational metadata in the shared SQLite database."""
 
@@ -72,6 +76,39 @@ class IngestionRepository:
             row["sha256"], SourceFileState(row["state"]),
         )
 
+    def find_source_file_by_hash(
+        self, workspace_id: str, sha256: str
+    ) -> SourceFile | None:
+        """Find prior content in this workspace, including retained history."""
+        with get_connection(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM source_files WHERE workspace_id = ? AND sha256 = ?",
+                (workspace_id, sha256),
+            ).fetchone()
+        if row is None:
+            return None
+        return SourceFile(
+            row["source_file_id"], row["workspace_id"], row["original_name"],
+            row["storage_key"], row["media_type"], row["size_bytes"],
+            row["sha256"], SourceFileState(row["state"]),
+        )
+
+    def list_incomplete_source_files(self) -> list[SourceFile]:
+        """Return intake rows that need crash recovery."""
+        with get_connection(self.database_path) as connection:
+            rows = connection.execute(
+                "SELECT * FROM source_files WHERE state IN ('receiving', 'quarantined') "
+                "ORDER BY created_at, source_file_id"
+            ).fetchall()
+        return [
+            SourceFile(
+                row["source_file_id"], row["workspace_id"], row["original_name"],
+                row["storage_key"], row["media_type"], row["size_bytes"],
+                row["sha256"], SourceFileState(row["state"]),
+            )
+            for row in rows
+        ]
+
     def transition_source_file(
         self, source_file_id: str, target: SourceFileState
     ) -> SourceFile:
@@ -87,17 +124,23 @@ class IngestionRepository:
         workspace_id: str,
         source_file_id: str,
         idempotency_key: str,
+        max_attempts: int = 3,
+        require_available: bool = False,
     ) -> IngestionJob:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1.")
         with get_connection(self.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             source = connection.execute(
-                "SELECT workspace_id FROM source_files WHERE source_file_id = ?",
+                "SELECT workspace_id, state FROM source_files WHERE source_file_id = ?",
                 (source_file_id,),
             ).fetchone()
             if source is not None and source["workspace_id"] != workspace_id:
                 raise ValueError(
                     "An ingestion job and its source file must belong to the same workspace."
                 )
+            if require_available and (source is None or source["state"] != "available"):
+                raise ValueError("A durable job requires an available source file.")
             connection.execute(
                 """INSERT INTO ingestion_jobs (
                     job_id, workspace_id, source_file_id, state, idempotency_key
@@ -105,26 +148,58 @@ class IngestionRepository:
                 (job_id, workspace_id, source_file_id,
                  IngestionJobState.QUEUED.value, idempotency_key),
             )
+            connection.execute(
+                "INSERT INTO ingestion_job_runtime (job_id, max_attempts) VALUES (?, ?)",
+                (job_id, max_attempts),
+            )
         return IngestionJob(job_id, workspace_id, source_file_id,
                             IngestionJobState.QUEUED, 0, idempotency_key)
 
     def get_job(self, job_id: str) -> IngestionJob | None:
         with get_connection(self.database_path) as connection:
             row = connection.execute(
-                "SELECT * FROM ingestion_jobs WHERE job_id = ?", (job_id,)
+                """SELECT job.*, runtime.state AS runtime_state,
+                          runtime.attempt_count AS runtime_attempt_count
+                   FROM ingestion_jobs AS job
+                   LEFT JOIN ingestion_job_runtime AS runtime USING (job_id)
+                   WHERE job.job_id = ?""", (job_id,)
             ).fetchone()
         if row is None:
             return None
+        if row["runtime_state"] is None:
+            raise RuntimeError(f"Job '{job_id}' has no runtime lifecycle record.")
         return IngestionJob(row["job_id"], row["workspace_id"],
-                            row["source_file_id"], IngestionJobState(row["state"]),
-                            row["attempt_count"], row["idempotency_key"])
+                            row["source_file_id"], IngestionJobState(row["runtime_state"]),
+                            row["runtime_attempt_count"], row["idempotency_key"])
 
     def transition_job(
         self, job_id: str, target: IngestionJobState
     ) -> IngestionJob:
-        return self._transition(
-            "ingestion_jobs", "job_id", job_id, IngestionJobState, target,
-            update_timestamp=True,
+        with get_connection(self.database_path) as connection:
+            row = connection.execute(
+                """SELECT runtime.state FROM ingestion_jobs AS job
+                   LEFT JOIN ingestion_job_runtime AS runtime USING (job_id)
+                   WHERE job.job_id = ?""", (job_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"ingestion_jobs record not found: {job_id}")
+        if row["state"] is None:
+            raise RuntimeError(f"Job '{job_id}' has no runtime lifecycle record.")
+        current = IngestionJobState(row["state"])
+        if target == current:
+            result = self.get_job(job_id)
+            assert result is not None
+            return result
+        if target == IngestionJobState.CANCELLED:
+            # A running worker must acknowledge cancellation while holding its lease.
+            from solarpv_ingestion.jobs import JobQueue
+
+            JobQueue(self.database_path).request_cancellation(job_id)
+            result = self.get_job(job_id)
+            assert result is not None
+            return result
+        raise JobLifecycleOwnershipError(
+            "This transition is owned by JobQueue and requires the current worker lease."
         )
 
     def create_dataset_version(

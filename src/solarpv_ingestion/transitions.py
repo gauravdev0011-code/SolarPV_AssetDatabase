@@ -24,9 +24,10 @@ TRANSITIONS: dict[type[StrEnum], dict[StrEnum, frozenset[StrEnum]]] = {
     },
     IngestionJobState: {
         IngestionJobState.QUEUED: frozenset({IngestionJobState.RUNNING, IngestionJobState.CANCELLED}),
-        IngestionJobState.RUNNING: frozenset({IngestionJobState.SUCCEEDED, IngestionJobState.RETRY_WAIT, IngestionJobState.FAILED_TERMINAL, IngestionJobState.CANCEL_REQUESTED}),
-        IngestionJobState.RETRY_WAIT: frozenset({IngestionJobState.QUEUED, IngestionJobState.CANCELLED}),
+        IngestionJobState.RUNNING: frozenset({IngestionJobState.SUCCEEDED, IngestionJobState.RETRY_WAIT, IngestionJobState.FAILED_TERMINAL, IngestionJobState.CANCEL_REQUESTED, IngestionJobState.RECONCILIATION_REQUIRED}),
+        IngestionJobState.RETRY_WAIT: frozenset({IngestionJobState.QUEUED, IngestionJobState.RUNNING, IngestionJobState.CANCELLED}),
         IngestionJobState.CANCEL_REQUESTED: frozenset({IngestionJobState.CANCELLED, IngestionJobState.SUCCEEDED, IngestionJobState.FAILED_TERMINAL}),
+        IngestionJobState.RECONCILIATION_REQUIRED: frozenset(),
     },
     DatasetVersionState: {
         DatasetVersionState.DRAFT: frozenset({DatasetVersionState.VALIDATING, DatasetVersionState.ARCHIVED}),

@@ -1,6 +1,7 @@
 """Typed records representing persisted ingestion metadata."""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from solarpv_ingestion.states import (
     ApprovalState,
@@ -31,6 +32,59 @@ class IngestionJob:
     state: IngestionJobState
     attempt_count: int
     idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class JobLease:
+    job: IngestionJob
+    lease_owner: str
+    lease_token: str
+    lease_expires_at: str
+    attempt_number: int
+
+
+@dataclass(frozen=True, slots=True)
+class JobRuntime:
+    job_id: str
+    state: IngestionJobState
+    attempt_count: int
+    max_attempts: int
+    available_at: str
+    lease_owner: str | None
+    lease_token: str | None
+    lease_expires_at: str | None
+    retry_of_job_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeResult:
+    source_file: SourceFile
+    duplicate: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeUpload:
+    intake_id: str
+    workspace_id: str
+    original_name: str
+    staging_key: str
+    storage_key: str
+    state: str
+    lease_owner: str | None
+    lease_token: str | None
+    lease_expires_at: str | None
+    size_bytes: int
+    sha256: str | None
+    media_type: str | None
+    source_file_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StagedFile:
+    path: Path
+    size_bytes: int
+    sha256: str
+    upload_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
