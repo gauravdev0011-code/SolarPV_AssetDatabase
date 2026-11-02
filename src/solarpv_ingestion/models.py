@@ -88,6 +88,38 @@ class StagedFile:
 
 
 @dataclass(frozen=True, slots=True)
+class ExtractionArtifact:
+    artifact_id: str
+    workspace_id: str
+    source_file_id: str
+    job_id: str
+    artifact_type: str
+    storage_key: str
+    parser_id: str
+    parser_version: str
+    schema_version: str
+    checksum: str
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class JobStatus:
+    job_id: str
+    workspace_id: str
+    source_file_id: str
+    state: IngestionJobState
+    attempt_count: int
+    max_attempts: int
+    available_at: str
+    error_code: str | None
+    error_message: str | None
+    progress_stage: str | None
+    artifact_id: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetVersion:
     dataset_version_id: str
     dataset_id: str

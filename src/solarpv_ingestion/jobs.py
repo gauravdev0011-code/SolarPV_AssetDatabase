@@ -41,6 +41,59 @@ class JobQueue:
         )
         return self.get_job(job_id)  # type: ignore[return-value]
 
+    def create_or_get_job(
+        self, *, job_id: str, workspace_id: str, source_file_id: str,
+        idempotency_key: str, max_attempts: int = 3,
+    ) -> tuple[JobRuntime, bool]:
+        """Atomically create a job or return its matching idempotent submission.
+
+        A key already bound to another source is rejected. Terminal jobs are
+        returned as-is; resubmission never silently restarts a terminal job.
+        """
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1.")
+        if not all(value.strip() for value in (job_id, workspace_id, source_file_id, idempotency_key)):
+            raise ValueError("Job, workspace, source, and idempotency identifiers are required.")
+        with get_connection(self.database_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """SELECT job.job_id, job.source_file_id, job.workspace_id,
+                          runtime.*
+                   FROM ingestion_jobs AS job
+                   JOIN ingestion_job_runtime AS runtime USING (job_id)
+                   WHERE job.workspace_id = ? AND job.idempotency_key = ?""",
+                (workspace_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if existing["source_file_id"] != source_file_id:
+                    raise ValueError("Idempotency key is already bound to another source.")
+                return _job_runtime_from_row(existing), True
+
+            source = connection.execute(
+                "SELECT workspace_id, state FROM source_files WHERE source_file_id = ?",
+                (source_file_id,),
+            ).fetchone()
+            if source is None:
+                raise KeyError(f"Source file not found: {source_file_id}")
+            if source["workspace_id"] != workspace_id:
+                raise ValueError("The source file belongs to another workspace.")
+            if source["state"] != "available":
+                raise ValueError("A durable job requires an available source file.")
+            connection.execute(
+                """INSERT INTO ingestion_jobs (
+                    job_id, workspace_id, source_file_id, state, idempotency_key
+                ) VALUES (?, ?, ?, 'queued', ?)""",
+                (job_id, workspace_id, source_file_id, idempotency_key),
+            )
+            connection.execute(
+                "INSERT INTO ingestion_job_runtime (job_id, max_attempts) VALUES (?, ?)",
+                (job_id, max_attempts),
+            )
+            row = connection.execute(
+                "SELECT * FROM ingestion_job_runtime WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return _job_runtime_from_row(row), False
+
     def create_retry_job(
         self, *, prior_job_id: str, job_id: str, idempotency_key: str,
         max_attempts: int | None = None,
@@ -229,6 +282,73 @@ class JobQueue:
         target = IngestionJobState.CANCELLED if cancelled else IngestionJobState.SUCCEEDED
         return self._finish_with_lease(job_id, lease_token, target, now=now)
 
+    def complete_job_with_artifact(
+        self,
+        job_id: str,
+        lease_token: str,
+        *,
+        artifact_id: str,
+        storage_key: str,
+        parser_id: str,
+        parser_version: str,
+        schema_version: str,
+        checksum: str,
+        now: datetime | None = None,
+    ) -> JobRuntime:
+        """Atomically persist result provenance and successful job completion.
+
+        If cancellation was requested while processing, cancellation wins and no
+        result row is made visible. The caller may then discard its unpublished
+        result object.
+        """
+        current = _utc(now)
+        if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+            raise ValueError("Artifact checksum must be a lowercase SHA-256 digest.")
+        if not all(value.strip() for value in (
+            artifact_id, storage_key, parser_id, parser_version, schema_version
+        )):
+            raise ValueError("Artifact identity and parser metadata are required.")
+        with get_connection(self.database_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = self._leased_row(connection, job_id, lease_token, current)
+            job = connection.execute(
+                "SELECT workspace_id, source_file_id FROM ingestion_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            cancelled = row["state"] == IngestionJobState.CANCEL_REQUESTED.value
+            target = (
+                IngestionJobState.CANCELLED if cancelled
+                else IngestionJobState.SUCCEEDED
+            )
+            validate_transition(IngestionJobState, row["state"], target)
+            if not cancelled:
+                connection.execute(
+                    """INSERT INTO extraction_artifacts (
+                        artifact_id, workspace_id, source_file_id, job_id,
+                        artifact_type, storage_key, parser_id, parser_version,
+                        schema_version, checksum
+                    ) VALUES (?, ?, ?, ?, 'processing_result', ?, ?, ?, ?, ?)""",
+                    (artifact_id, job["workspace_id"], job["source_file_id"], job_id,
+                     storage_key, parser_id, parser_version, schema_version, checksum),
+                )
+            stamp = _timestamp(current)
+            connection.execute(
+                """UPDATE ingestion_job_runtime SET state = ?, lease_owner = NULL,
+                   lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+                   WHERE job_id = ?""",
+                (target.value, stamp, job_id),
+            )
+            connection.execute(
+                "UPDATE ingestion_jobs SET state = ?, lease_expires_at = NULL, "
+                "updated_at = CURRENT_TIMESTAMP WHERE job_id = ?",
+                (target.value, job_id),
+            )
+            self._finish_attempt(
+                connection, job_id, row["attempt_count"],
+                "cancelled" if cancelled else "succeeded", None, None, current,
+            )
+        return self.get_job(job_id)  # type: ignore[return-value]
+
     def fail_job(
         self, job_id: str, lease_token: str, *, error_code: str,
         error_message: str, retryable: bool,
@@ -408,3 +528,11 @@ def _safe_error_code(value: str) -> str:
 def _safe_error_message(value: str) -> str:
     clean = " ".join("".join(char for char in value if char.isprintable()).split())
     return clean[:500] or "Job failed without an error message."
+
+
+def _job_runtime_from_row(row) -> JobRuntime:
+    return JobRuntime(
+        row["job_id"], IngestionJobState(row["state"]), row["attempt_count"],
+        row["max_attempts"], row["available_at"], row["lease_owner"],
+        row["lease_token"], row["lease_expires_at"], row["retry_of_job_id"],
+    )

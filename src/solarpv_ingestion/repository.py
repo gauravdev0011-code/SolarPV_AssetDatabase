@@ -6,7 +6,9 @@ from solarpv_db.database import DEFAULT_DATABASE, get_connection
 from solarpv_ingestion.models import (
     Approval,
     DatasetVersion,
+    ExtractionArtifact,
     IngestionJob,
+    JobStatus,
     PromotionOperation,
     SourceFile,
 )
@@ -171,6 +173,56 @@ class IngestionRepository:
         return IngestionJob(row["job_id"], row["workspace_id"],
                             row["source_file_id"], IngestionJobState(row["runtime_state"]),
                             row["runtime_attempt_count"], row["idempotency_key"])
+
+    def get_job_status(self, job_id: str) -> JobStatus | None:
+        """Return safe job status fields without exposing worker lease tokens."""
+        with get_connection(self.database_path) as connection:
+            row = connection.execute(
+                """SELECT job.job_id, job.workspace_id, job.source_file_id,
+                          runtime.state, runtime.attempt_count, runtime.max_attempts,
+                          runtime.available_at, runtime.last_error_code,
+                          runtime.last_error_message, job.progress_stage,
+                          job.created_at, job.updated_at,
+                          (SELECT artifact.artifact_id FROM extraction_artifacts AS artifact
+                           WHERE artifact.job_id = job.job_id
+                             AND artifact.artifact_type = 'processing_result'
+                           ORDER BY artifact.created_at DESC LIMIT 1) AS artifact_id
+                   FROM ingestion_jobs AS job
+                   LEFT JOIN ingestion_job_runtime AS runtime USING (job_id)
+                   WHERE job.job_id = ?""",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["state"] is None:
+            raise RuntimeError(f"Job '{job_id}' has no runtime lifecycle record.")
+        return JobStatus(
+            row["job_id"], row["workspace_id"], row["source_file_id"],
+            IngestionJobState(row["state"]), row["attempt_count"],
+            row["max_attempts"], row["available_at"], row["last_error_code"],
+            row["last_error_message"], row["progress_stage"], row["artifact_id"],
+            row["created_at"], row["updated_at"],
+        )
+
+    def get_artifact(self, artifact_id: str) -> ExtractionArtifact | None:
+        with get_connection(self.database_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM extraction_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        return _artifact_from_row(row) if row is not None else None
+
+    def get_job_result(self, job_id: str) -> ExtractionArtifact | None:
+        with get_connection(self.database_path) as connection:
+            row = connection.execute(
+                """SELECT artifact.* FROM extraction_artifacts AS artifact
+                   JOIN ingestion_job_runtime AS runtime USING (job_id)
+                   WHERE artifact.job_id = ? AND artifact.artifact_type = 'processing_result'
+                     AND runtime.state = 'succeeded'
+                   ORDER BY artifact.created_at DESC LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+        return _artifact_from_row(row) if row is not None else None
 
     def transition_job(
         self, job_id: str, target: IngestionJobState
@@ -424,3 +476,12 @@ class IngestionRepository:
                 result["outcome"], result["result_json"],
             )
         raise TypeError(f"Unsupported state machine table: {table}")
+
+
+def _artifact_from_row(row) -> ExtractionArtifact:
+    return ExtractionArtifact(
+        row["artifact_id"], row["workspace_id"], row["source_file_id"],
+        row["job_id"], row["artifact_type"], row["storage_key"],
+        row["parser_id"], row["parser_version"], row["schema_version"],
+        row["checksum"], row["created_at"],
+    )

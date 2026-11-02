@@ -290,6 +290,10 @@ class LocalArtifactStorage:
     def read_bytes(self, key: str) -> bytes:
         return self._resolve_key(key).read_bytes()
 
+    def open_read(self, key: str) -> BinaryIO:
+        """Open a stored object for bounded, read-only streaming."""
+        return self._resolve_key(key).open("rb")
+
     def put_bytes(self, key: str, content: bytes) -> None:
         if not isinstance(content, bytes):
             raise TypeError("Artifact content must be bytes.")

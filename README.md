@@ -127,3 +127,21 @@ docs/DATA_DICTIONARY.md             Field definitions and allowed values
 ## Research-data and privacy policy
 
 Do not commit private research files, credentials, personally identifiable information, or a real local database. Only share research data when it has been approved for repository use. Keep data origin, units, quality, and source references intact when importing real observations.
+
+## Local ingestion API and worker (Phase 2B)
+
+Set explicit local paths before starting either process. Keep the storage path private and outside the repository:
+
+```powershell
+$env:SOLARPV_DB_PATH = "C:\SolarPV\solarpv.db"
+$env:SOLARPV_STORAGE_PATH = "C:\SolarPV\private-storage"
+python -m uvicorn solarpv_api.app:app --host 127.0.0.1 --port 8000
+```
+
+In a separate terminal with the same environment, run the sequential durable worker:
+
+```powershell
+python -m solarpv_ingestion.worker
+```
+
+The API accepts individual `.csv` and `.json` uploads at `POST /api/v1/uploads`. Check source metadata at `GET /api/v1/uploads/{source_file_id}`, job state at `GET /api/v1/jobs/{job_id}`, request cancellation at `POST /api/v1/jobs/{job_id}/cancel`, and retrieve a completed processing profile at `GET /api/v1/jobs/{job_id}/result`. Processing creates generic extraction summaries only; it does not insert uploaded records into Solar PV domain tables. Configure `SOLARPV_MAX_FILE_BYTES`, `SOLARPV_MAX_JSON_BYTES`, `SOLARPV_LEASE_SECONDS`, `SOLARPV_RETRY_DELAY_SECONDS`, and `SOLARPV_WORKER_POLL_SECONDS` to adjust resource and worker limits.
