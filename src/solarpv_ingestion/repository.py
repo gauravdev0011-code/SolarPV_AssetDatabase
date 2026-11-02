@@ -354,18 +354,25 @@ class IngestionRepository:
                         ApprovalState.PENDING)
 
     def transition_approval(
-        self, approval_id: str, target: ApprovalState, *, decision_by: str | None = None
+        self, approval_id: str, target: ApprovalState, *, decision_by: str | None = None,
+        idempotent: bool = False,
     ) -> Approval:
         if target == ApprovalState.APPROVED and not (decision_by and decision_by.strip()):
             raise ValueError("An approving operator must be recorded.")
         with get_connection(self.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT state FROM approvals WHERE approval_id = ?", (approval_id,)
+                "SELECT approval_id, state, decision_by, dataset_version_id, validation_run_id "
+                "FROM approvals WHERE approval_id = ?", (approval_id,)
             ).fetchone()
             if row is None:
                 raise KeyError(f"Approval not found: {approval_id}")
             current = ApprovalState(row["state"])
+            if current == target and idempotent:
+                if row["decision_by"] != decision_by:
+                    raise ValueError("Approval decision was already recorded by another reviewer.")
+                return Approval(row["approval_id"], row["dataset_version_id"],
+                                row["validation_run_id"], current)
             validate_transition(ApprovalState, current, target)
             if target == ApprovalState.REVOKED:
                 promotion = connection.execute(

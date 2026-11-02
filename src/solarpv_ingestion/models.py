@@ -125,6 +125,45 @@ class DatasetVersion:
     dataset_id: str
     version_number: int
     state: DatasetVersionState
+    workspace_id: str = "default"
+    name: str | None = None
+    source_file_id: str | None = None
+    source_job_id: str | None = None
+    source_artifact_id: str | None = None
+    source_sha256: str | None = None
+    row_count: int | None = None
+    mapping_revision_id: str | None = None
+    current_validation_run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetMapping:
+    mapping_revision_id: str
+    dataset_version_id: str
+    revision_number: int
+    fingerprint: str
+    columns: tuple[dict, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetValidation:
+    validation_run_id: str
+    dataset_version_id: str
+    rule_set_version: str
+    outcome: str
+    source_file_id: str
+    source_sha256: str
+    source_artifact_id: str
+    parser_id: str
+    parser_version: str
+    processing_result_checksum: str
+    result_schema_version: str
+    mapping_revision_id: str | None
+    input_fingerprint: str
+    result_key: str
+    result_checksum: str
+    error_count: int
+    warning_count: int
 
 
 @dataclass(frozen=True, slots=True)

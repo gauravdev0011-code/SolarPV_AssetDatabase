@@ -7,6 +7,8 @@ from fastapi import FastAPI
 
 from solarpv_api.config import Settings
 from solarpv_api.routes import router
+from solarpv_api.dataset_routes import router as dataset_router
+from solarpv_ingestion.datasets import DatasetService
 from solarpv_ingestion.intake import FileIntakeService
 from solarpv_ingestion.jobs import JobQueue
 from solarpv_ingestion.repository import IngestionRepository
@@ -82,6 +84,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.storage = storage
         app.state.repository = IngestionRepository(configured.database_path)
         app.state.queue = JobQueue(configured.database_path)
+        app.state.datasets = DatasetService(
+            configured.database_path, storage, max_json_bytes=configured.max_json_bytes,
+        )
         app.state.intake = FileIntakeService(
             database_path=configured.database_path, storage=storage,
             max_file_bytes=configured.max_file_bytes,
@@ -91,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="SOLARIS Ingestion API", version="1.0.0", lifespan=lifespan)
     app.state.settings = configured
     app.include_router(router)
+    app.include_router(dataset_router)
     # Multipart framing and form fields need bounded overhead in addition to file bytes.
     app.add_middleware(UploadRequestLimitMiddleware, max_request_bytes=configured.max_file_bytes + 1024 * 1024)
     return app

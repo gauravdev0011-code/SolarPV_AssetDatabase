@@ -122,6 +122,13 @@ def _profile_json(source, storage, max_bytes, cancelled):
     _walk_json(document, stats, 0, cancelled)
     return {
         "root_type": _json_type(document),
+        "record_count": (
+            len(document) if isinstance(document, list) and all(isinstance(item, dict) for item in document)
+            else len(document["records"]) if isinstance(document, dict)
+            and isinstance(document.get("records"), list)
+            and all(isinstance(item, dict) for item in document["records"])
+            else 1 if isinstance(document, dict) else None
+        ),
         "node_count": stats["nodes"],
         "max_depth": stats["max_depth"],
         "value_types": dict(stats["types"]),

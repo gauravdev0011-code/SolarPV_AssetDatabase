@@ -180,8 +180,8 @@ def test_legacy_database_migrates_without_changing_existing_rows(tmp_path):
         row = migrated.execute("SELECT external_id, name FROM assets").fetchone()
         assert (row["external_id"], row["name"]) == ("OLD-1", "Existing")
         assert migrated.execute("SELECT source_hash FROM imported_files").fetchone()[0] == "old-hash"
-        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 8
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 9
 
 
 def test_migration_007_adds_runtime_controls_without_rewriting_existing_jobs(
@@ -418,7 +418,7 @@ def test_empty_migration_ledger_is_treated_as_untracked_legacy(tmp_path):
 
     with get_connection(database_path) as migrated:
         assert migrated.execute("SELECT name FROM assets WHERE external_id = 'OLD'").fetchone()[0] == "Retained"
-        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 8
+        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
 
 
 @pytest.mark.parametrize(("ledger_version", "pragma_version"), [(8, 7), (7, 8)])
@@ -441,9 +441,9 @@ def test_unknown_future_migration_version_is_rejected(tmp_path):
     initialize_database(database_path)
     with get_connection(database_path) as connection:
         connection.execute(
-            "INSERT INTO schema_migrations (version, name, checksum) VALUES (9, 'future', 'future')"
+            "INSERT INTO schema_migrations (version, name, checksum) VALUES (10, 'future', 'future')"
         )
-        connection.execute("PRAGMA user_version = 9")
+        connection.execute("PRAGMA user_version = 10")
 
     with pytest.raises(RuntimeError, match="newer than available"):
         initialize_database(database_path)
@@ -454,7 +454,7 @@ def test_migration_reapplication_is_idempotent(tmp_path):
     initialize_database(database_path)
     initialize_database(database_path)
     with get_connection(database_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
         assert connection.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 1
 
 
@@ -621,8 +621,8 @@ def test_concurrent_migration_initialization_is_serialized(tmp_path):
         list(executor.map(lambda _: initialize(), range(2)))
 
     with get_connection(database_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 8
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
 
 
 def test_migration_runner_ignores_trailing_sql_comments(tmp_path, monkeypatch):
@@ -1238,7 +1238,7 @@ def test_validation_run_identity_and_approved_outcome_are_immutable(tmp_path):
     )
     assert other_approval == "approval-validation-parent"
     with get_connection(database_path) as connection:
-        with pytest.raises(sqlite3.IntegrityError, match="validation run dataset version"):
+        with pytest.raises(sqlite3.IntegrityError, match="validation result evidence is immutable"):
             connection.execute(
                 "UPDATE validation_runs SET dataset_version_id = ? "
                 "WHERE validation_run_id = 'validation-1'",
@@ -1249,7 +1249,7 @@ def test_validation_run_identity_and_approved_outcome_are_immutable(tmp_path):
                 "UPDATE approvals SET validation_run_id = 'validation-validation-parent' "
                 "WHERE approval_id = 'approval-1'"
             )
-        with pytest.raises(sqlite3.IntegrityError, match="outcome is immutable"):
+        with pytest.raises(sqlite3.IntegrityError, match="validation result evidence is immutable"):
             connection.execute(
                 "UPDATE validation_runs SET outcome = 'failed' "
                 "WHERE validation_run_id = 'validation-1'"
