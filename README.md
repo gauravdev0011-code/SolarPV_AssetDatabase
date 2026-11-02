@@ -1,132 +1,143 @@
 # Solar PV Asset Database
 
-A Python and SQLite project for maintaining solar asset records, preserving inspection history, recording observations and maintenance, and preparing trustworthy data for condition-trend analysis.
+A Python and SQLite system for organizing solar assets, preserving inspection history, and preparing reliable data for future condition-trend analysis.
 
-## Project status
+> **Project status:** Database foundation and Week 1–3 acceptance checks are complete. The dashboard and condition-trend analysis are planned for a later phase.
 
-**Implemented and tested:** SQLite schema and initialization, asset operations, inspection history, observations, maintenance records, JSON/CSV import, source-content duplicate protection, input validation, and transaction rollback.
+## At a glance
 
-**Week 1–3 acceptance dataset:** 20 synthetic assets, 40 inspections (at least two per asset), 80 observations, and 10 maintenance records. The dataset is illustrative only and is not real solar-panel research data.
+- **Language:** Python 3.13+
+- **Database:** SQLite
+- **Testing:** pytest and a repeatable acceptance script
+- **Import formats:** CSV folders and JSON files
+- **Sample data:** Synthetic only — not real solar research measurements
 
-**Next phase:** build the dashboard and condition-trend views after acceptance checks pass.
+## Why this project exists
 
-## Data integrity principles
+Solar equipment can be inspected many times. Keeping each inspection and its measurements linked to the correct asset makes it easier to review past records and, in a later phase, compare condition over time.
 
-- Each asset has a stable external identifier such as `PV-001`.
-- An inspection is a separate historical event; later inspections do not overwrite earlier inspections.
-- Observations belong to an inspection, and maintenance records belong to an asset.
-- Measurement values include units and a data-quality label.
-- Real, synthetic, and unknown data origins are distinguished.
-- Imports are validated before records are written.
-- Import writes run in a database transaction; a database constraint failure rolls back the batch.
-- Re-importing the same source content is skipped using a SHA-256 content fingerprint.
-- Sample data is explicitly marked synthetic. Do not present it as measured research data.
+The database is designed to keep asset identity stable, preserve inspection history, retain measurement units and data-quality labels, and handle import errors safely.
 
-## Requirements
+## Current capabilities
 
-- Python 3.13 or later
-- pip
-- Git (for cloning the repository)
+- Store and retrieve solar assets, inspections, observations, and maintenance records.
+- Keep each inspection as a separate historical event.
+- Link observations to the inspection where they were recorded.
+- Preserve measurement units, data-quality labels, and data origin.
+- Import data from a JSON file or a folder of four CSV files.
+- Validate imports and reject invalid references before writing records.
+- Skip an identical source import using a SHA-256 content fingerprint.
+- Use a database transaction so a failed import does not leave a partial batch.
+- Run unit tests and acceptance checks locally and through GitHub Actions.
 
-The project uses the Python standard library for its database and importer. Pytest is used for automated tests.
+## Verified test dataset
 
-## Set up on Windows
+The Week 1–3 synthetic dataset contains:
 
-From PowerShell, clone the repository and enter its folder:
+| Record type | Count |
+|---|---:|
+| Assets | 20 |
+| Inspections | 40 |
+| Observations | 80 |
+| Maintenance records | 10 |
+
+**Validation result:** 49 unit tests passed, and all Week 1–3 acceptance checks passed in the verified run.
+
+The acceptance checks include inspection coverage, joined history for `PV-001`, duplicate-import handling, invalid observation references, and rollback after a database constraint failure. The sample values are for software testing only; they are not field measurements and must not be used for engineering decisions.
+
+## Quick start (Windows PowerShell)
+
+### 1. Get the code
 
 ```powershell
 git clone https://github.com/gauravdev0011-code/SolarPV_AssetDatabase.git
 cd SolarPV_AssetDatabase
 ```
 
-Create and activate a virtual environment:
+### 2. Create an environment and install the project
 
 ```powershell
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-Install the project and development dependencies:
-
-```powershell
 py -m pip install --upgrade pip
 py -m pip install -e ".[dev]"
 ```
 
-If PowerShell blocks virtual-environment activation, use the Python executable inside the environment directly, for example `.venv\Scripts\python.exe -m pytest -v`.
+If PowerShell blocks environment activation, run the environment's Python directly, for example `.venv\Scripts\python.exe -m pytest -v`.
 
-## Run automated tests
-
-Run the complete unit-test suite:
+### 3. Run the tests
 
 ```powershell
 py -m pytest -v
-```
-
-The current suite contains 49 tests covering database setup and the asset, inspection, observation, maintenance, and importer operations. The expected result is 49 passing tests; rerun this command after code changes.
-
-## Run Week 1–3 acceptance checks
-
-Run from the repository root:
-
-```powershell
 py scripts/verify_week3_acceptance.py
 ```
 
-The acceptance script creates temporary databases and checks:
+Run both commands after making changes. The acceptance script creates temporary databases and removes them when finished; it does not overwrite the project's normal database.
 
-1. The sample CSV dataset imports 20 assets, 40 inspections, 80 observations, and 10 maintenance records.
-2. Every asset has at least two inspections.
-3. A joined SQL query retrieves inspection and observation history for `PV-001`.
-4. Re-importing the identical dataset is skipped and does not duplicate records.
-5. An observation referencing a nonexistent inspection is rejected before any sample records are written.
-6. A deliberate uniqueness conflict after an earlier insert causes the complete import transaction to roll back.
+## Importing sample data
 
-The script stores its test databases in a temporary directory and removes them when it finishes. It does not use or overwrite the normal project database.
+The sample files are in `data/sample/`. The importer accepts either:
 
-## Import data
+- A JSON file with the four top-level arrays `assets`, `inspections`, `observations`, and `maintenance`; or
+- A directory containing `assets.csv`, `inspections.csv`, `observations.csv`, and `maintenance.csv`.
 
-The importer accepts either:
-
-- A JSON file with exactly four top-level arrays: `assets`, `inspections`, `observations`, and `maintenance`; or
-- A directory containing exactly these four CSV files: `assets.csv`, `inspections.csv`, `observations.csv`, and `maintenance.csv`.
-
-The committed example is in `data/sample/`. It is synthetic demonstration data.
-
-After the project is installed, a CSV folder can be imported into the default database with:
+After installation, import the sample CSV folder into the default local database with:
 
 ```powershell
 py -c "from solarpv_db.database import initialize_database; from solarpv_db.importer import import_data; initialize_database(); print(import_data('data/sample'))"
 ```
 
-The default database path is `data/solarpv.db`. The importer creates an `imported_files` table on first use to record source hashes. Re-importing identical file content returns `status: skipped`. A changed dataset is not automatically merged or updated; records that conflict with existing unique identifiers will fail rather than silently overwrite existing history.
+The default database path is `data/solarpv.db`. Local databases and private research data should not be committed to Git.
 
-## Database tables
+## How the data fits together
 
-| Table | Purpose |
-|---|---|
-| `assets` | Stable asset identity, type, name, description, and location |
-| `inspections` | Timestamped inspection events and their origin/status |
-| `observations` | Measurements or findings linked to an inspection |
-| `maintenance_records` | Maintenance history linked to an asset |
-| `imported_files` | Source-content fingerprints used for duplicate-import protection |
+```mermaid
+erDiagram
+    ASSETS ||--o{ INSPECTIONS : has
+    INSPECTIONS ||--o{ OBSERVATIONS : records
+    ASSETS ||--o{ MAINTENANCE_RECORDS : receives
+```
 
-The detailed field-level data dictionary is in [docs/DATA_DICTIONARY.md](docs/DATA_DICTIONARY.md).
+The importer also keeps source fingerprints in `imported_files` to recognize identical imports. See the [data dictionary](docs/DATA_DICTIONARY.md) for field definitions and allowed values, and [architecture notes](docs/ARCHITECTURE.md) for the current design.
 
 ## Repository layout
 
 ```text
-migrations/001_initial_schema.sql   Initial database schema
-src/solarpv_db/                     Database and domain operations
-tests/unit/                         Automated unit tests
-data/sample/                        Approved synthetic CSV dataset
-scripts/verify_week3_acceptance.py  Reproducible acceptance checks
-docs/DATA_DICTIONARY.md             Field definitions and allowed values
+migrations/       Database schema
+src/solarpv_db/   Database operations and data importer
+tests/unit/       Unit tests
+data/sample/      Synthetic CSV dataset for testing
+scripts/          Repeatable acceptance checks
+docs/             Data dictionary and design notes
+.github/          GitHub automation and repository templates
 ```
 
-## Research-data and privacy policy
+## Development
 
-Do not commit private research files, credentials, personally identifiable information, or a real local database. Only share research data when it has been approved for repository use. Keep data origin, units, quality, and source references intact when importing real observations.
+Before opening a pull request:
+
+1. Run `py -m pytest -v`.
+2. Run `py scripts/verify_week3_acceptance.py`.
+3. Update documentation if behavior or the data format changes.
+4. Keep sample data clearly labeled as synthetic.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the project workflow.
+
+## Data handling
+
+Do not commit credentials, personal information, private research files, or local database files. Only use research data that has been approved for the repository. Preserve units, data origin, source references, and quality labels when importing observations.
+
+## Roadmap
+
+- [x] Establish the SQLite database foundation.
+- [x] Add CSV/JSON import and data-integrity checks.
+- [x] Add unit and Week 1–3 acceptance tests.
+- [ ] Develop asset history and condition-trend analysis.
+- [ ] Build a dashboard after the history and trend requirements are defined.
+
+---
+
+This project is under active development. The current implementation is a tested project foundation, not yet a production deployment or a completed condition-monitoring dashboard.
 
 ## Local ingestion API and worker (Phase 2B)
 
