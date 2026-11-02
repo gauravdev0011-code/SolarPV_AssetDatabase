@@ -110,10 +110,31 @@ def test_import_json_creates_all_record_types(
         assert connection.execute(
             "SELECT COUNT(*) FROM maintenance_records"
         ).fetchone()[0] == 1
-
         assert connection.execute(
             "SELECT COUNT(*) FROM imported_files"
         ).fetchone()[0] == 1
+
+
+def test_identical_import_content_is_deduplicated_within_each_workspace_only(
+    tmp_path, database_path, sample_data
+):
+    source = write_json(tmp_path / "shared.json", sample_data)
+    with get_connection(database_path) as connection:
+        connection.execute(
+            "INSERT INTO workspaces(workspace_id,name) VALUES('workspace-b','Workspace B')"
+        )
+
+    first = import_data(source, database_path, workspace_id="default")
+    replay = import_data(source, database_path, workspace_id="default")
+    second = import_data(source, database_path, workspace_id="workspace-b")
+
+    assert first["status"] == "imported"
+    assert replay["status"] == "skipped"
+    assert second["status"] == "imported"
+    assert len(list_assets(database_path, workspace_id="default")) == 1
+    assert len(list_assets(database_path, workspace_id="workspace-b")) == 1
+    with get_connection(database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM imported_files").fetchone()[0] == 2
 
 
 def test_reimporting_identical_json_is_skipped(

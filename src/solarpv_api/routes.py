@@ -9,12 +9,18 @@ from fastapi import APIRouter, HTTPException, Request
 from solarpv_ingestion.intake import UnsafeUploadError
 from solarpv_ingestion.storage import UploadTooLargeError
 from solarpv_api.schemas import job_response, source_response as serialize_source_response
+from solarpv_db.workspaces import WorkspaceNotFound
 
-router = APIRouter(prefix="/api/v1")
+router = APIRouter()
 
 
 @router.post("/uploads", status_code=202)
-async def upload_file(request: Request):
+async def upload_file(request: Request, workspace_id: str = "default"):
+    workspace_id = _workspace_for_route(request, workspace_id)
+    try:
+        request.app.state.workspaces.get(workspace_id)
+    except WorkspaceNotFound as error:
+        raise HTTPException(404, "Workspace not found.") from error
     content_type = request.headers.get("content-type", "").lower()
     if not content_type.startswith("multipart/form-data"):
         raise HTTPException(415, "Upload must use multipart/form-data.")
@@ -33,7 +39,7 @@ async def upload_file(request: Request):
         raise HTTPException(415, "Only CSV and JSON uploads are supported.")
     try:
         accepted = request.app.state.intake.accept(
-            upload.file, workspace_id="default", original_filename=filename,
+            upload.file, workspace_id=workspace_id, original_filename=filename,
             media_type=upload.content_type,
         )
     except UploadTooLargeError as error:
@@ -57,26 +63,29 @@ async def upload_file(request: Request):
 
 
 @router.get("/uploads/{source_file_id}")
-def get_upload(source_file_id: str, request: Request):
-    source = request.app.state.repository.get_source_file(source_file_id)
+def get_upload(source_file_id: str, request: Request, workspace_id: str = "default"):
+    workspace_id = _workspace_for_route(request, workspace_id)
+    source = request.app.state.repository.get_source_file(source_file_id, workspace_id=workspace_id)
     if source is None:
         raise HTTPException(404, "Source file not found.")
     return serialize_source_response(source)
 
 
 @router.get("/jobs/{job_id}")
-def get_job(job_id: str, request: Request):
-    status = request.app.state.repository.get_job_status(job_id)
+def get_job(job_id: str, request: Request, workspace_id: str = "default"):
+    workspace_id = _workspace_for_route(request, workspace_id)
+    status = request.app.state.repository.get_job_status(job_id, workspace_id=workspace_id)
     if status is None:
         raise HTTPException(404, "Job not found.")
     return job_response(status)
 
 
 @router.get("/jobs/{job_id}/result")
-def get_result(job_id: str, request: Request):
-    artifact = request.app.state.repository.get_job_result(job_id)
+def get_result(job_id: str, request: Request, workspace_id: str = "default"):
+    workspace_id = _workspace_for_route(request, workspace_id)
+    artifact = request.app.state.repository.get_job_result(job_id, workspace_id=workspace_id)
     if artifact is None:
-        status = request.app.state.repository.get_job_status(job_id)
+        status = request.app.state.repository.get_job_status(job_id, workspace_id=workspace_id)
         if status is None:
             raise HTTPException(404, "Job not found.")
         raise HTTPException(409, "Processing result is not available.")
@@ -100,11 +109,19 @@ def get_result(job_id: str, request: Request):
 
 
 @router.post("/jobs/{job_id}/cancel")
-def cancel_job(job_id: str, request: Request):
+def cancel_job(job_id: str, request: Request, workspace_id: str = "default"):
+    workspace_id = _workspace_for_route(request, workspace_id)
     try:
-        runtime = request.app.state.queue.request_cancellation(job_id)
+        runtime = request.app.state.queue.request_cancellation(job_id, workspace_id=workspace_id)
     except KeyError as error:
         raise HTTPException(404, "Job not found.") from error
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
     return {"job_id": job_id, "state": runtime.state.value}
+
+
+def _workspace_for_route(request: Request, path_workspace_id: str) -> str:
+    """Keep legacy routes pinned to default; scoped routes use their path ID."""
+    if request.url.path.startswith("/api/v1/workspaces/"):
+        return path_workspace_id
+    return "default"

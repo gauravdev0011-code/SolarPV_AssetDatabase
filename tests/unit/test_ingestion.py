@@ -180,8 +180,8 @@ def test_legacy_database_migrates_without_changing_existing_rows(tmp_path):
         row = migrated.execute("SELECT external_id, name FROM assets").fetchone()
         assert (row["external_id"], row["name"]) == ("OLD-1", "Existing")
         assert migrated.execute("SELECT source_hash FROM imported_files").fetchone()[0] == "old-hash"
-        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
-        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
+        assert migrated.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 def test_migration_007_adds_runtime_controls_without_rewriting_existing_jobs(
@@ -418,7 +418,7 @@ def test_empty_migration_ledger_is_treated_as_untracked_legacy(tmp_path):
 
     with get_connection(database_path) as migrated:
         assert migrated.execute("SELECT name FROM assets WHERE external_id = 'OLD'").fetchone()[0] == "Retained"
-        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 9
+        assert migrated.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 10
 
 
 @pytest.mark.parametrize(("ledger_version", "pragma_version"), [(8, 7), (7, 8)])
@@ -441,9 +441,9 @@ def test_unknown_future_migration_version_is_rejected(tmp_path):
     initialize_database(database_path)
     with get_connection(database_path) as connection:
         connection.execute(
-            "INSERT INTO schema_migrations (version, name, checksum) VALUES (10, 'future', 'future')"
+            "INSERT INTO schema_migrations (version, name, checksum) VALUES (11, 'future', 'future')"
         )
-        connection.execute("PRAGMA user_version = 10")
+        connection.execute("PRAGMA user_version = 11")
 
     with pytest.raises(RuntimeError, match="newer than available"):
         initialize_database(database_path)
@@ -454,7 +454,7 @@ def test_migration_reapplication_is_idempotent(tmp_path):
     initialize_database(database_path)
     initialize_database(database_path)
     with get_connection(database_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 10
         assert connection.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 1
 
 
@@ -621,8 +621,8 @@ def test_concurrent_migration_initialization_is_serialized(tmp_path):
         list(executor.map(lambda _: initialize(), range(2)))
 
     with get_connection(database_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
 
 
 def test_migration_runner_ignores_trailing_sql_comments(tmp_path, monkeypatch):
@@ -1036,11 +1036,20 @@ def test_successful_promotion_and_evidence_are_immutable(tmp_path):
             connection.execute(
                 "DELETE FROM promotion_domain_records WHERE promotion_id = 'immutable'"
             )
+        connection.execute(
+            "INSERT INTO assets(workspace_id,external_id,asset_type,name) "
+            "VALUES('default','PROMO-OTHER','panel','Other panel')"
+        )
+        replacement_id = connection.execute(
+            "SELECT asset_id FROM assets WHERE external_id = 'PROMO-OTHER'"
+        ).fetchone()[0]
         with pytest.raises(sqlite3.IntegrityError, match="immutable"):
             connection.execute(
-                "UPDATE promotion_domain_records SET record_id = record_id + 100 "
-                "WHERE promotion_id = 'immutable'"
+                "UPDATE promotion_domain_records SET record_id = ? "
+                "WHERE promotion_id = 'immutable' AND record_type = 'asset'",
+                (replacement_id,),
             )
+        connection.execute("DELETE FROM assets WHERE asset_id = ?", (replacement_id,))
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute(
                 """INSERT INTO promotion_domain_records (
@@ -1405,6 +1414,27 @@ def test_promotion_rejects_content_not_linked_to_approved_source(tmp_path):
     with get_connection(database_path) as connection:
         assert connection.execute(
             "SELECT COUNT(*) FROM promotion_operations"
+        ).fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
+
+
+def test_promotion_cannot_be_requested_in_a_different_workspace(tmp_path):
+    database_path = tmp_path / "promotion-workspace.db"
+    initialize_database(database_path)
+    source, _ = _approved_source(tmp_path, database_path)
+    with get_connection(database_path) as connection:
+        connection.execute(
+            "INSERT INTO workspaces(workspace_id,name) VALUES('other-workspace','Other workspace')"
+        )
+
+    with pytest.raises(ValueError, match="workspace does not match"):
+        import_data(
+            source, database_path, promotion_id="cross-workspace-promotion",
+            approval_id="approval-1", workspace_id="other-workspace",
+        )
+    with get_connection(database_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM promotion_operations WHERE promotion_id='cross-workspace-promotion'"
         ).fetchone()[0] == 0
         assert connection.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 0
 

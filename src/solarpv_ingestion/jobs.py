@@ -230,10 +230,12 @@ class JobQueue:
             )
         return expiry
 
-    def request_cancellation(self, job_id: str) -> JobRuntime:
+    def request_cancellation(
+        self, job_id: str, *, workspace_id: str | None = None
+    ) -> JobRuntime:
         with get_connection(self.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            row = self._runtime_row(connection, job_id)
+            row = self._runtime_row(connection, job_id, workspace_id=workspace_id)
             current = IngestionJobState(row["state"])
             if current == IngestionJobState.CANCEL_REQUESTED:
                 return JobRuntime(
@@ -470,9 +472,14 @@ class JobQueue:
         return self.get_job(job_id)  # type: ignore[return-value]
 
     @staticmethod
-    def _runtime_row(connection: sqlite3.Connection, job_id: str):
+    def _runtime_row(
+        connection: sqlite3.Connection, job_id: str, *, workspace_id: str | None = None
+    ):
         row = connection.execute(
-            "SELECT * FROM ingestion_job_runtime WHERE job_id = ?", (job_id,)
+            """SELECT runtime.* FROM ingestion_job_runtime runtime
+               JOIN ingestion_jobs job USING (job_id)
+               WHERE runtime.job_id = ? AND (? IS NULL OR job.workspace_id = ?)""",
+            (job_id, workspace_id, workspace_id),
         ).fetchone()
         if row is None:
             raise KeyError(f"Job not found: {job_id}")

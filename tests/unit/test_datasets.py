@@ -113,7 +113,7 @@ def test_migration_009_upgrades_populated_version_008_database_without_data_loss
     initialize_database(path)
     with sqlite3.connect(path) as upgraded:
         upgraded.row_factory = sqlite3.Row
-        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 9
+        assert upgraded.execute("PRAGMA user_version").fetchone()[0] == 10
         assert tuple(upgraded.execute("SELECT external_id, name FROM assets WHERE asset_id = 71").fetchone()) == (
             "LEGACY-71", "Legacy inverter"
         )
@@ -121,5 +121,5 @@ def test_migration_009_upgrades_populated_version_008_database_without_data_loss
             "SELECT dataset_id, version_number, state FROM dataset_versions WHERE dataset_version_id = 'legacy-version'"
         ).fetchone()) == ("legacy-dataset", 1, "draft")
         assert upgraded.execute("SELECT COUNT(*) FROM dataset_mapping_revisions").fetchone()[0] == 0
-        assert upgraded.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 9
+        assert upgraded.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 10
         assert upgraded.execute("PRAGMA foreign_key_check").fetchall() == []

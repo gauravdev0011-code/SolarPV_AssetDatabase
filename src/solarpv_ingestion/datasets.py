@@ -47,20 +47,21 @@ class DatasetService:
         self.max_json_bytes = max_json_bytes
         self.repository = IngestionRepository(database_path)
 
-    def create_dataset(self, *, name: str, job_id: str, idempotency_key: str) -> dict:
+    def create_dataset(self, *, name: str, job_id: str, idempotency_key: str,
+                       workspace_id: str = "default") -> dict:
         name = _required_text(name, "name", 200)
         key = _required_text(idempotency_key, "idempotency_key", 200)
         request_fingerprint = _fingerprint({"operation": "create_dataset", "name": name, "job_id": job_id})
         dataset_id, version_id, request_id = uuid4().hex, uuid4().hex, uuid4().hex
         with get_connection(self.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            replay = self._find_request(connection, key, request_fingerprint)
+            replay = self._find_request(connection, key, request_fingerprint, workspace_id)
             if replay:
-                return self._version_dict(connection, replay["dataset_version_id"])
-            source, artifact, profile = self._processed_job(connection, job_id)
+                return self._version_dict(connection, replay["dataset_version_id"], workspace_id)
+            source, artifact, profile = self._processed_job(connection, job_id, workspace_id)
             cursor = connection.execute(
-                "INSERT INTO datasets(dataset_id, workspace_id, name) VALUES (?, 'default', ?)",
-                (dataset_id, name),
+                "INSERT INTO datasets(dataset_id, workspace_id, name) VALUES (?, ?, ?)",
+                (dataset_id, workspace_id, name),
             )
             connection.execute(
                 """INSERT INTO dataset_versions (
@@ -82,30 +83,31 @@ class DatasetService:
                 """INSERT INTO dataset_version_requests(
                     request_id, workspace_id, dataset_id, dataset_version_id,
                     job_id, idempotency_key, request_fingerprint
-                ) VALUES (?, 'default', ?, ?, ?, ?, ?)""",
-                (request_id, dataset_id, version_id, job_id, key, request_fingerprint),
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (request_id, workspace_id, dataset_id, version_id, job_id, key, request_fingerprint),
             )
             connection.execute("UPDATE datasets SET updated_at = CURRENT_TIMESTAMP WHERE dataset_id = ?", (dataset_id,))
-            return self._version_dict(connection, version_id)
+            return self._version_dict(connection, version_id, workspace_id)
 
-    def create_version(self, dataset_id: str, *, job_id: str, idempotency_key: str) -> dict:
+    def create_version(self, dataset_id: str, *, job_id: str, idempotency_key: str,
+                       workspace_id: str = "default") -> dict:
         key = _required_text(idempotency_key, "idempotency_key", 200)
         request_fingerprint = _fingerprint({"operation": "create_version", "dataset_id": dataset_id, "job_id": job_id})
         version_id, request_id = uuid4().hex, uuid4().hex
         with get_connection(self.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            replay = self._find_request(connection, key, request_fingerprint)
+            replay = self._find_request(connection, key, request_fingerprint, workspace_id)
             if replay:
                 if replay["dataset_id"] != dataset_id:
                     raise DatasetConflict("Idempotency key is already used by another dataset request.")
-                return self._version_dict(connection, replay["dataset_version_id"])
+                return self._version_dict(connection, replay["dataset_version_id"], workspace_id)
             dataset = connection.execute(
-                "SELECT dataset_id FROM datasets WHERE dataset_id = ? AND workspace_id = 'default'",
-                (dataset_id,),
+                "SELECT dataset_id FROM datasets WHERE dataset_id = ? AND workspace_id = ?",
+                (dataset_id, workspace_id),
             ).fetchone()
             if dataset is None:
                 raise DatasetNotFound(dataset_id)
-            source, artifact, profile = self._processed_job(connection, job_id)
+            source, artifact, profile = self._processed_job(connection, job_id, workspace_id)
             number = connection.execute(
                 "SELECT COALESCE(MAX(version_number), 0) + 1 FROM dataset_versions WHERE dataset_id = ?",
                 (dataset_id,),
@@ -128,13 +130,14 @@ class DatasetService:
                 """INSERT INTO dataset_version_requests(
                     request_id, workspace_id, dataset_id, dataset_version_id,
                     job_id, idempotency_key, request_fingerprint
-                ) VALUES (?, 'default', ?, ?, ?, ?, ?)""",
-                (request_id, dataset_id, version_id, job_id, key, request_fingerprint),
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (request_id, workspace_id, dataset_id, version_id, job_id, key, request_fingerprint),
             )
             connection.execute("UPDATE datasets SET updated_at = CURRENT_TIMESTAMP WHERE dataset_id = ?", (dataset_id,))
-            return self._version_dict(connection, version_id)
+            return self._version_dict(connection, version_id, workspace_id)
 
-    def list_datasets(self, *, limit: int = 50, offset: int = 0) -> dict:
+    def list_datasets(self, *, limit: int = 50, offset: int = 0,
+                      workspace_id: str = "default") -> dict:
         _page(limit, offset)
         with get_connection(self.database_path) as connection:
             rows = connection.execute(
@@ -147,20 +150,20 @@ class DatasetService:
                            JOIN approvals a ON a.dataset_version_id = v.dataset_version_id
                            WHERE v.dataset_id = dataset.dataset_id AND a.state = 'approved'
                            ORDER BY a.decision_at DESC, a.created_at DESC LIMIT 1) AS approved_version_number
-                   FROM datasets dataset WHERE workspace_id = 'default'
+                   FROM datasets dataset WHERE workspace_id = ?
                    ORDER BY created_at DESC, dataset_id LIMIT ? OFFSET ?""",
-                (limit, offset),
+                (workspace_id, limit, offset),
             ).fetchall()
             count = connection.execute(
-                "SELECT COUNT(*) FROM datasets WHERE workspace_id = 'default'"
+                "SELECT COUNT(*) FROM datasets WHERE workspace_id = ?", (workspace_id,)
             ).fetchone()[0]
         return {"items": [dict(row) for row in rows], "total": count, "limit": limit, "offset": offset}
 
-    def get_dataset(self, dataset_id: str) -> dict:
+    def get_dataset(self, dataset_id: str, *, workspace_id: str = "default") -> dict:
         with get_connection(self.database_path) as connection:
             row = connection.execute(
-                "SELECT * FROM datasets WHERE dataset_id = ? AND workspace_id = 'default'",
-                (dataset_id,),
+                "SELECT * FROM datasets WHERE dataset_id = ? AND workspace_id = ?",
+                (dataset_id, workspace_id),
             ).fetchone()
             if row is None:
                 raise DatasetNotFound(dataset_id)
@@ -170,26 +173,28 @@ class DatasetService:
                      ON dataset.dataset_id = version.dataset_id
                    LEFT JOIN dataset_sources source
                      ON source.dataset_version_id = version.dataset_version_id
-                   WHERE version.dataset_id = ?
+                   WHERE version.dataset_id = ? AND dataset.workspace_id = ?
                    ORDER BY version.version_number DESC, source.dataset_source_id""",
-                (dataset_id,),
+                (dataset_id, workspace_id),
             ).fetchall()
             latest_approval = connection.execute(
                 """SELECT approval.* FROM approvals approval
                    JOIN dataset_versions version ON version.dataset_version_id = approval.dataset_version_id
+                   JOIN datasets dataset ON dataset.dataset_id = version.dataset_id
                    WHERE version.dataset_id = ? AND approval.state = 'approved'
+                     AND dataset.workspace_id = ?
                    ORDER BY approval.decision_at DESC, approval.created_at DESC LIMIT 1""",
-                (dataset_id,),
+                (dataset_id, workspace_id),
             ).fetchone()
         return {"dataset_id": row["dataset_id"], "workspace_id": row["workspace_id"],
                 "name": row["name"], "created_at": row["created_at"], "updated_at": row["updated_at"],
                 "versions": [self._version_dict_from_row(v) for v in versions],
                 "approved_version_id": latest_approval["dataset_version_id"] if latest_approval else None}
 
-    def list_versions(self, dataset_id: str) -> list[dict]:
+    def list_versions(self, dataset_id: str, *, workspace_id: str = "default") -> list[dict]:
         with get_connection(self.database_path) as connection:
             if connection.execute(
-                "SELECT 1 FROM datasets WHERE dataset_id = ? AND workspace_id = 'default'", (dataset_id,)
+                "SELECT 1 FROM datasets WHERE dataset_id = ? AND workspace_id = ?", (dataset_id, workspace_id)
             ).fetchone() is None:
                 raise DatasetNotFound(dataset_id)
             rows = connection.execute(
@@ -198,7 +203,7 @@ class DatasetService:
             ).fetchall()
         return [self._version_dict_from_row(row) for row in rows]
 
-    def get_version(self, dataset_id: str, version_id: str) -> dict:
+    def get_version(self, dataset_id: str, version_id: str, *, workspace_id: str = "default") -> dict:
         with get_connection(self.database_path) as connection:
             row = connection.execute(
                 """SELECT version.*, dataset.name, dataset.workspace_id, source.source_file_id
@@ -207,23 +212,24 @@ class DatasetService:
                    LEFT JOIN dataset_sources source
                      ON source.dataset_version_id = version.dataset_version_id
                    WHERE dataset.dataset_id = ? AND version.dataset_version_id = ?
-                     AND dataset.workspace_id = 'default'
-                   ORDER BY source.dataset_source_id LIMIT 1""", (dataset_id, version_id)
+                     AND dataset.workspace_id = ?
+                   ORDER BY source.dataset_source_id LIMIT 1""", (dataset_id, version_id, workspace_id)
             ).fetchone()
             if row is None:
                 raise DatasetNotFound(version_id)
             return self._version_dict_from_row(row)
 
-    def get_profile(self, dataset_id: str, version_id: str) -> dict:
-        version = self.get_version(dataset_id, version_id)
+    def get_profile(self, dataset_id: str, version_id: str, *, workspace_id: str = "default") -> dict:
+        version = self.get_version(dataset_id, version_id, workspace_id=workspace_id)
         if version["profile"] is None:
             raise DatasetError("Dataset profile is unavailable.")
         return {"dataset_id": dataset_id, "dataset_version_id": version_id,
                 "source_file_id": version["source_file_id"], "source_sha256": version["source_sha256"],
                 "processing_job_id": version["source_job_id"], "profile": version["profile"]}
 
-    def get_preview(self, dataset_id: str, version_id: str, *, limit: int = 20) -> dict:
-        version = self.get_version(dataset_id, version_id)
+    def get_preview(self, dataset_id: str, version_id: str, *, limit: int = 20,
+                    workspace_id: str = "default") -> dict:
+        version = self.get_version(dataset_id, version_id, workspace_id=workspace_id)
         with get_connection(self.database_path) as connection:
             row = connection.execute(
                 """SELECT file.storage_key, file.original_name, file.sha256, file.size_bytes FROM dataset_sources source
@@ -241,7 +247,8 @@ class DatasetService:
                 "source_file_id": version["source_file_id"], "source_sha256": version["source_sha256"],
                 **preview}
 
-    def save_mapping(self, dataset_id: str, version_id: str, *, columns: list[dict], idempotency_key: str) -> dict:
+    def save_mapping(self, dataset_id: str, version_id: str, *, columns: list[dict],
+                     idempotency_key: str, workspace_id: str = "default") -> dict:
         if not isinstance(columns, list) or len(columns) > 500:
             raise DatasetError("Mapping must be an array of at most 500 column mappings.")
         key = _required_text(idempotency_key, "idempotency_key", 200)
@@ -254,7 +261,7 @@ class DatasetService:
         mapping_id = uuid4().hex
         with get_connection(self.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            version = self._require_version(connection, dataset_id, version_id)
+            version = self._require_version(connection, dataset_id, version_id, workspace_id)
             if version["state"] != "draft":
                 raise DatasetConflict("Mappings are frozen after validation begins.")
             prior = connection.execute(
@@ -292,17 +299,18 @@ class DatasetService:
             )
             return self._mapping_dict(connection, mapping_id)
 
-    def get_mapping(self, dataset_id: str, version_id: str) -> dict | None:
-        version = self.get_version(dataset_id, version_id)
+    def get_mapping(self, dataset_id: str, version_id: str, *, workspace_id: str = "default") -> dict | None:
+        version = self.get_version(dataset_id, version_id, workspace_id=workspace_id)
         if version["mapping_revision_id"] is None:
             return None
         with get_connection(self.database_path) as connection:
             return self._mapping_dict(connection, version["mapping_revision_id"])
 
-    def validate(self, dataset_id: str, version_id: str, *, idempotency_key: str) -> dict:
+    def validate(self, dataset_id: str, version_id: str, *, idempotency_key: str,
+                 workspace_id: str = "default") -> dict:
         key = _required_text(idempotency_key, "idempotency_key", 200)
-        version = self.get_version(dataset_id, version_id)
-        source = self._source_for_version(version_id)
+        version = self.get_version(dataset_id, version_id, workspace_id=workspace_id)
+        source = self._source_for_version(version_id, workspace_id)
         if not self.storage.matches(source["storage_key"], sha256=source["sha256"], size_bytes=source["size_bytes"]):
             raise DatasetError("Original source does not match its recorded fingerprint.")
         artifact = self.repository.get_artifact(version["source_artifact_id"])
@@ -333,7 +341,7 @@ class DatasetService:
             if prior:
                 if prior["input_fingerprint"] != input_fingerprint:
                     raise DatasetConflict("Validation idempotency key was reused with different inputs.")
-                return self.get_validation(prior["validation_run_id"])
+                return self.get_validation(prior["validation_run_id"], workspace_id=workspace_id)
             pending = connection.execute(
                 "SELECT 1 FROM approvals WHERE dataset_version_id = ? AND state = 'pending' LIMIT 1",
                 (version_id,),
@@ -380,7 +388,7 @@ class DatasetService:
         try:
             with get_connection(self.database_path) as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                current = self._require_version(connection, dataset_id, version_id)
+                current = self._require_version(connection, dataset_id, version_id, workspace_id)
                 if current["state"] not in {"draft", "validating"} or current["mapping_revision_id"] != version["mapping_revision_id"]:
                     raise DatasetConflict("Dataset inputs changed during validation.")
                 if connection.execute(
@@ -430,10 +438,14 @@ class DatasetService:
         report["result_checksum"] = checksum
         return report
 
-    def get_validation(self, validation_id: str) -> dict:
+    def get_validation(self, validation_id: str, *, workspace_id: str = "default") -> dict:
         with get_connection(self.database_path) as connection:
             row = connection.execute(
-                "SELECT * FROM validation_runs WHERE validation_run_id = ?", (validation_id,)
+                """SELECT validation.* FROM validation_runs validation
+                   JOIN dataset_versions version ON version.dataset_version_id=validation.dataset_version_id
+                   JOIN datasets dataset ON dataset.dataset_id=version.dataset_id
+                   WHERE validation.validation_run_id=? AND dataset.workspace_id=?""",
+                (validation_id, workspace_id),
             ).fetchone()
         if row is None:
             raise DatasetNotFound(validation_id)
@@ -450,13 +462,14 @@ class DatasetService:
         result["result_checksum"] = row["result_checksum"]
         return result
 
-    def create_approval(self, dataset_id: str, version_id: str, *, validation_run_id: str, idempotency_key: str) -> dict:
+    def create_approval(self, dataset_id: str, version_id: str, *, validation_run_id: str,
+                        idempotency_key: str, workspace_id: str = "default") -> dict:
         key = _required_text(idempotency_key, "idempotency_key", 200)
         fingerprint = _fingerprint({"dataset_id": dataset_id, "version_id": version_id, "validation_run_id": validation_run_id})
         approval_id = uuid4().hex
         with get_connection(self.database_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            version = self._require_version(connection, dataset_id, version_id)
+            version = self._require_version(connection, dataset_id, version_id, workspace_id)
             if version["state"] != "valid" or version["current_validation_run_id"] != validation_run_id:
                 raise DatasetConflict("Approval requires the current validation for a valid version.")
             run = connection.execute(
@@ -485,7 +498,8 @@ class DatasetService:
             )
             return self._approval_dict(row)
 
-    def decide_approval(self, approval_id: str, *, decision: str, reviewer_identity: str) -> dict:
+    def decide_approval(self, approval_id: str, *, decision: str, reviewer_identity: str,
+                        workspace_id: str = "default") -> dict:
         try:
             target = ApprovalState(decision)
         except ValueError as error:
@@ -496,13 +510,20 @@ class DatasetService:
         try:
             self.repository.transition_approval(
                 approval_id, target, decision_by=reviewer, idempotent=True,
+                workspace_id=workspace_id,
             )
         except KeyError as error:
             raise DatasetNotFound(approval_id) from error
         except (InvalidStateTransition, ValueError) as error:
             raise DatasetConflict(str(error)) from error
         with get_connection(self.database_path) as connection:
-            row = connection.execute("SELECT * FROM approvals WHERE approval_id = ?", (approval_id,)).fetchone()
+            row = connection.execute(
+                """SELECT approval.* FROM approvals approval
+                   JOIN dataset_versions version ON version.dataset_version_id=approval.dataset_version_id
+                   JOIN datasets dataset ON dataset.dataset_id=version.dataset_id
+                   WHERE approval.approval_id=? AND dataset.workspace_id=?""",
+                (approval_id, workspace_id),
+            ).fetchone()
             if row is not None:
                 connection.execute(
                     """UPDATE datasets SET updated_at = CURRENT_TIMESTAMP
@@ -511,19 +532,19 @@ class DatasetService:
                 )
         return self._approval_dict(row)
 
-    def get_approval(self, approval_id: str) -> dict:
+    def get_approval(self, approval_id: str, *, workspace_id: str = "default") -> dict:
         with get_connection(self.database_path) as connection:
             row = connection.execute(
                 """SELECT approval.* FROM approvals approval
                    JOIN dataset_versions version ON version.dataset_version_id = approval.dataset_version_id
                    JOIN datasets dataset ON dataset.dataset_id = version.dataset_id
-                   WHERE approval.approval_id = ? AND dataset.workspace_id = 'default'""", (approval_id,)
+                   WHERE approval.approval_id = ? AND dataset.workspace_id = ?""", (approval_id, workspace_id)
             ).fetchone()
         if row is None:
             raise DatasetNotFound(approval_id)
         return self._approval_dict(row)
 
-    def _processed_job(self, connection, job_id: str):
+    def _processed_job(self, connection, job_id: str, workspace_id: str):
         row = connection.execute(
             """SELECT file.*, job.state AS job_state, job.workspace_id AS job_workspace,
                       runtime.state AS runtime_state,
@@ -532,12 +553,14 @@ class DatasetService:
                JOIN ingestion_job_runtime runtime ON runtime.job_id = job.job_id
                JOIN source_files file ON file.source_file_id = job.source_file_id
                JOIN extraction_artifacts artifact ON artifact.job_id = job.job_id
-               WHERE job.job_id = ? AND artifact.artifact_type = 'processing_result'
-               ORDER BY artifact.created_at DESC LIMIT 1""", (job_id,)
+               WHERE job.job_id = ? AND job.workspace_id = ?
+                 AND artifact.artifact_type = 'processing_result'
+               ORDER BY artifact.created_at DESC LIMIT 1""", (job_id, workspace_id)
         ).fetchone()
         if (row is None or row["job_state"] != "succeeded" or row["runtime_state"] != "succeeded"
-                or row["state"] != "available" or row["job_workspace"] != "default"):
-            raise DatasetError("Dataset registration requires a successful job and available default-workspace source.")
+                or row["state"] != "available" or row["job_workspace"] != workspace_id
+                or row["workspace_id"] != workspace_id):
+            raise DatasetError("Dataset registration requires a successful job and available source in this workspace.")
         source = connection.execute("SELECT * FROM source_files WHERE source_file_id = ?", (row["source_file_id"],)).fetchone()
         artifact = connection.execute("SELECT * FROM extraction_artifacts WHERE artifact_id = ?", (row["artifact_id"],)).fetchone()
         if not self.storage.matches(source["storage_key"], sha256=source["sha256"], size_bytes=source["size_bytes"]):
@@ -565,33 +588,36 @@ class DatasetService:
             raise DatasetError("Processing result does not contain a valid profile.")
         return result
 
-    def _find_request(self, connection, key: str, fingerprint: str):
+    def _find_request(self, connection, key: str, fingerprint: str, workspace_id: str):
         row = connection.execute(
-            "SELECT * FROM dataset_version_requests WHERE workspace_id = 'default' AND idempotency_key = ?",
-            (key,),
+            "SELECT * FROM dataset_version_requests WHERE workspace_id = ? AND idempotency_key = ?",
+            (workspace_id, key),
         ).fetchone()
         if row and row["request_fingerprint"] != fingerprint:
             raise DatasetConflict("Dataset idempotency key was reused with different request content.")
         return row
 
-    def _require_version(self, connection, dataset_id: str, version_id: str):
+    def _require_version(self, connection, dataset_id: str, version_id: str,
+                         workspace_id: str = "default"):
         row = connection.execute(
             """SELECT version.*, dataset.workspace_id FROM dataset_versions version
                JOIN datasets dataset ON dataset.dataset_id = version.dataset_id
                WHERE version.dataset_version_id = ? AND version.dataset_id = ?
-                 AND dataset.workspace_id = 'default'""", (version_id, dataset_id)
+                 AND dataset.workspace_id = ?""", (version_id, dataset_id, workspace_id)
         ).fetchone()
         if row is None:
             raise DatasetNotFound(version_id)
         return row
 
-    def _version_dict(self, connection, version_id: str) -> dict:
+    def _version_dict(self, connection, version_id: str,
+                      workspace_id: str = "default") -> dict:
         row = connection.execute(
             """SELECT version.*, dataset.name, dataset.workspace_id, source.source_file_id
                FROM dataset_versions version JOIN datasets dataset ON dataset.dataset_id = version.dataset_id
                LEFT JOIN dataset_sources source ON source.dataset_version_id = version.dataset_version_id
-               WHERE version.dataset_version_id = ? ORDER BY source.dataset_source_id LIMIT 1""",
-            (version_id,),
+               WHERE version.dataset_version_id = ? AND dataset.workspace_id = ?
+               ORDER BY source.dataset_source_id LIMIT 1""",
+            (version_id, workspace_id),
         ).fetchone()
         if row is None:
             raise DatasetNotFound(version_id)
@@ -638,13 +664,14 @@ class DatasetService:
                 (mapping_id,),
             ).fetchall()]
 
-    def _source_for_version(self, version_id: str):
+    def _source_for_version(self, version_id: str, workspace_id: str = "default"):
         with get_connection(self.database_path) as connection:
             row = connection.execute(
                 """SELECT file.* FROM dataset_sources source
                    JOIN source_files file ON file.source_file_id = source.source_file_id
-                   WHERE source.dataset_version_id = ? ORDER BY source.dataset_source_id LIMIT 1""",
-                (version_id,),
+               WHERE source.dataset_version_id = ? AND file.workspace_id = ?
+               ORDER BY source.dataset_source_id LIMIT 1""",
+            (version_id, workspace_id),
             ).fetchone()
         if row is None:
             raise DatasetError("Dataset source is unavailable.")

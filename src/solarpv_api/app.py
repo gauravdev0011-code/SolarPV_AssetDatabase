@@ -8,11 +8,15 @@ from fastapi import FastAPI
 from solarpv_api.config import Settings
 from solarpv_api.routes import router
 from solarpv_api.dataset_routes import router as dataset_router
+from solarpv_api.workspace_routes import router as workspace_router
+from solarpv_api.dashboard_routes import router as dashboard_router
 from solarpv_ingestion.datasets import DatasetService
 from solarpv_ingestion.intake import FileIntakeService
 from solarpv_ingestion.jobs import JobQueue
 from solarpv_ingestion.repository import IngestionRepository
 from solarpv_ingestion.storage import LocalArtifactStorage
+from solarpv_db.dashboard import DashboardService
+from solarpv_db.workspaces import WorkspaceService
 
 
 class UploadRequestLimitMiddleware:
@@ -23,7 +27,13 @@ class UploadRequestLimitMiddleware:
         self.max_request_bytes = max_request_bytes
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("path") != "/api/v1/uploads" or scope.get("method") != "POST":
+        path_parts = scope.get("path", "").strip("/").split("/")
+        is_upload_path = (
+            path_parts == ["api", "v1", "uploads"]
+            or (len(path_parts) == 5 and path_parts[:3] == ["api", "v1", "workspaces"]
+                and path_parts[4] == "uploads")
+        )
+        if scope["type"] != "http" or not is_upload_path or scope.get("method") != "POST":
             await self.app(scope, receive, send)
             return
         headers = dict(scope.get("headers", []))
@@ -87,6 +97,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.datasets = DatasetService(
             configured.database_path, storage, max_json_bytes=configured.max_json_bytes,
         )
+        app.state.workspaces = WorkspaceService(configured.database_path)
+        app.state.dashboard = DashboardService(configured.database_path)
         app.state.intake = FileIntakeService(
             database_path=configured.database_path, storage=storage,
             max_file_bytes=configured.max_file_bytes,
@@ -95,8 +107,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="SOLARIS Ingestion API", version="1.0.0", lifespan=lifespan)
     app.state.settings = configured
-    app.include_router(router)
-    app.include_router(dataset_router)
+    app.include_router(router, prefix="/api/v1")
+    app.include_router(dataset_router, prefix="/api/v1")
+    app.include_router(workspace_router)
+    app.include_router(dashboard_router)
+    # Preserve the pre-workspace API as a default-workspace compatibility surface.
+    app.include_router(router, prefix="/api/v1/workspaces/{workspace_id}")
+    app.include_router(dataset_router, prefix="/api/v1/workspaces/{workspace_id}")
     # Multipart framing and form fields need bounded overhead in addition to file bytes.
     app.add_middleware(UploadRequestLimitMiddleware, max_request_bytes=configured.max_file_bytes + 1024 * 1024)
     return app

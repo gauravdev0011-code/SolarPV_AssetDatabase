@@ -64,11 +64,14 @@ class IngestionRepository:
         return SourceFile(source_file_id, workspace_id, original_name, storage_key,
                           media_type, size_bytes, sha256, state)
 
-    def get_source_file(self, source_file_id: str) -> SourceFile | None:
+    def get_source_file(
+        self, source_file_id: str, *, workspace_id: str | None = None
+    ) -> SourceFile | None:
         with get_connection(self.database_path) as connection:
             row = connection.execute(
-                "SELECT * FROM source_files WHERE source_file_id = ?",
-                (source_file_id,),
+                "SELECT * FROM source_files WHERE source_file_id = ? "
+                "AND (? IS NULL OR workspace_id = ?)",
+                (source_file_id, workspace_id, workspace_id),
             ).fetchone()
         if row is None:
             return None
@@ -174,7 +177,9 @@ class IngestionRepository:
                             row["source_file_id"], IngestionJobState(row["runtime_state"]),
                             row["runtime_attempt_count"], row["idempotency_key"])
 
-    def get_job_status(self, job_id: str) -> JobStatus | None:
+    def get_job_status(
+        self, job_id: str, *, workspace_id: str | None = None
+    ) -> JobStatus | None:
         """Return safe job status fields without exposing worker lease tokens."""
         with get_connection(self.database_path) as connection:
             row = connection.execute(
@@ -189,8 +194,8 @@ class IngestionRepository:
                            ORDER BY artifact.created_at DESC LIMIT 1) AS artifact_id
                    FROM ingestion_jobs AS job
                    LEFT JOIN ingestion_job_runtime AS runtime USING (job_id)
-                   WHERE job.job_id = ?""",
-                (job_id,),
+                   WHERE job.job_id = ? AND (? IS NULL OR job.workspace_id = ?)""",
+                (job_id, workspace_id, workspace_id),
             ).fetchone()
         if row is None:
             return None
@@ -212,15 +217,18 @@ class IngestionRepository:
             ).fetchone()
         return _artifact_from_row(row) if row is not None else None
 
-    def get_job_result(self, job_id: str) -> ExtractionArtifact | None:
+    def get_job_result(
+        self, job_id: str, *, workspace_id: str | None = None
+    ) -> ExtractionArtifact | None:
         with get_connection(self.database_path) as connection:
             row = connection.execute(
                 """SELECT artifact.* FROM extraction_artifacts AS artifact
                    JOIN ingestion_job_runtime AS runtime USING (job_id)
                    WHERE artifact.job_id = ? AND artifact.artifact_type = 'processing_result'
+                     AND (? IS NULL OR artifact.workspace_id = ?)
                      AND runtime.state = 'succeeded'
                    ORDER BY artifact.created_at DESC LIMIT 1""",
-                (job_id,),
+                (job_id, workspace_id, workspace_id),
             ).fetchone()
         return _artifact_from_row(row) if row is not None else None
 
@@ -355,7 +363,7 @@ class IngestionRepository:
 
     def transition_approval(
         self, approval_id: str, target: ApprovalState, *, decision_by: str | None = None,
-        idempotent: bool = False,
+        idempotent: bool = False, workspace_id: str | None = None,
     ) -> Approval:
         if target == ApprovalState.APPROVED and not (decision_by and decision_by.strip()):
             raise ValueError("An approving operator must be recorded.")
@@ -363,7 +371,13 @@ class IngestionRepository:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT approval_id, state, decision_by, dataset_version_id, validation_run_id "
-                "FROM approvals WHERE approval_id = ?", (approval_id,)
+                """FROM approvals approval WHERE approval_id = ?
+                   AND (? IS NULL OR EXISTS (
+                       SELECT 1 FROM dataset_versions version
+                       JOIN datasets dataset ON dataset.dataset_id=version.dataset_id
+                       WHERE version.dataset_version_id=approval.dataset_version_id
+                         AND dataset.workspace_id=?))""",
+                (approval_id, workspace_id, workspace_id),
             ).fetchone()
             if row is None:
                 raise KeyError(f"Approval not found: {approval_id}")
@@ -387,8 +401,13 @@ class IngestionRepository:
                     )
             cursor = connection.execute(
                 """UPDATE approvals SET state = ?, decision_by = ?,
-                   decision_at = CURRENT_TIMESTAMP WHERE approval_id = ? AND state = ?""",
-                (target.value, decision_by, approval_id, current.value),
+                   decision_at = CURRENT_TIMESTAMP WHERE approval_id = ? AND state = ?
+                   AND (? IS NULL OR EXISTS (
+                       SELECT 1 FROM dataset_versions version
+                       JOIN datasets dataset ON dataset.dataset_id=version.dataset_id
+                       WHERE version.dataset_version_id=approvals.dataset_version_id
+                         AND dataset.workspace_id=?))""",
+                (target.value, decision_by, approval_id, current.value, workspace_id, workspace_id),
             )
             if cursor.rowcount != 1:
                 raise ConcurrentStateChangeError(

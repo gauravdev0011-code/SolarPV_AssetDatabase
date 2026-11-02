@@ -195,6 +195,9 @@ def _validate_records(data):
         external_id = _required_text(asset, "external_id", context)
         _required_text(asset, "asset_type", context)
         _required_text(asset, "name", context)
+        data_origin = asset.get("data_origin", "unknown")
+        if data_origin not in VALID_DATA_ORIGINS:
+            raise ValueError(f"{context}: invalid data_origin '{data_origin}'.")
 
         if external_id in asset_ids:
             raise ValueError(
@@ -416,6 +419,7 @@ def import_data(
     *,
     promotion_id: str | None = None,
     approval_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, str | int]:
     """Import legacy data or execute an approved, idempotent promotion."""
     try:
@@ -424,6 +428,7 @@ def import_data(
             database_path,
             promotion_id=promotion_id,
             approval_id=approval_id,
+            workspace_id=workspace_id,
         )
     except sqlite3.Error as error:
         if promotion_id is not None:
@@ -441,6 +446,7 @@ def _import_data(
     *,
     promotion_id: str | None = None,
     approval_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, str | int]:
     """Validate and transactionally import JSON or CSV data.
 
@@ -456,6 +462,13 @@ def _import_data(
         approval_id = approval_id.strip()
     elif approval_id is not None:
         raise ValueError("Approval ID can only be supplied with a promotion ID.")
+    requested_workspace_id = workspace_id
+    if workspace_id is None and promotion_id is None:
+        workspace_id = "default"
+    if workspace_id is not None:
+        if not isinstance(workspace_id, str) or not workspace_id.strip():
+            raise ValueError("Workspace ID must be a non-empty string.")
+        workspace_id = workspace_id.strip()
 
     data, source_hash, source_name = _read_source(source_path)
     _validate_records(data)
@@ -464,9 +477,12 @@ def _import_data(
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS imported_files (
-                source_hash TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL DEFAULT 'default'
+                    REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+                source_hash TEXT NOT NULL,
                 source_name TEXT NOT NULL,
-                imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (workspace_id, source_hash)
             )
             """
         )
@@ -475,10 +491,12 @@ def _import_data(
         if promotion_id is not None:
             connection.execute("BEGIN IMMEDIATE")
             existing_promotion = connection.execute(
-                "SELECT source_hash, approval_id, source_name, dataset_id, "
-                "dataset_version_id, request_fingerprint, state, result_json, "
-                "outcome, attempt_count, already_imported_before "
-                "FROM promotion_operations WHERE promotion_id = ?",
+                "SELECT operation.source_hash, operation.approval_id, operation.source_name, "
+                "operation.dataset_id, operation.dataset_version_id, operation.request_fingerprint, "
+                "operation.state, operation.result_json, operation.outcome, operation.attempt_count, "
+                "operation.already_imported_before, dataset.workspace_id "
+                "FROM promotion_operations AS operation LEFT JOIN datasets AS dataset "
+                "ON dataset.dataset_id = operation.dataset_id WHERE operation.promotion_id = ?",
                 (promotion_id,),
             ).fetchone()
             if existing_promotion is not None:
@@ -486,6 +504,8 @@ def _import_data(
                     existing_promotion["source_hash"] != source_hash
                     or existing_promotion["approval_id"] != approval_id
                     or existing_promotion["source_name"] != source_name
+                    or (requested_workspace_id is not None
+                        and existing_promotion["workspace_id"] != requested_workspace_id)
                 ):
                     raise ValueError(
                         "Promotion ID conflict: source, source name, or approval "
@@ -514,7 +534,8 @@ def _import_data(
                     )
 
             approved_source = connection.execute(
-                """SELECT version.dataset_id, version.dataset_version_id
+                """SELECT version.dataset_id, version.dataset_version_id,
+                          dataset.workspace_id
                    FROM approvals AS approval
                    JOIN validation_runs AS validation
                      ON validation.validation_run_id = approval.validation_run_id
@@ -547,6 +568,13 @@ def _import_data(
                 )
             dataset_id = approved_source["dataset_id"]
             dataset_version_id = approved_source["dataset_version_id"]
+            promotion_workspace_id = approved_source["workspace_id"]
+            if (requested_workspace_id is not None
+                    and requested_workspace_id != promotion_workspace_id):
+                raise ValueError(
+                    "Promotion workspace does not match the approved dataset workspace."
+                )
+            workspace_id = promotion_workspace_id
             request_fingerprint = _promotion_request_fingerprint(
                 source_hash=source_hash,
                 source_name=source_name,
@@ -562,10 +590,9 @@ def _import_data(
                     "Promotion ID conflict: dataset version differs from the original request."
                 )
             if existing_promotion is None:
-                already_imported_before = connection.execute(
-                    "SELECT 1 FROM imported_files WHERE source_hash = ?",
-                    (source_hash,),
-                ).fetchone() is not None
+                already_imported_before = _import_marker_exists(
+                    connection, workspace_id, source_hash
+                ) is not None
                 connection.execute(
                     """INSERT INTO promotion_operations (
                         promotion_id, approval_id, source_hash, source_name,
@@ -625,10 +652,7 @@ def _import_data(
                     raise ValueError(
                         f"Promotion operation cannot run from state '{state.value}'."
                     )
-                already_imported = connection.execute(
-                    "SELECT 1 FROM imported_files WHERE source_hash = ?",
-                    (source_hash,),
-                ).fetchone()
+                already_imported = _import_marker_exists(connection, workspace_id, source_hash)
                 if (
                     already_imported is not None
                     and existing_promotion["already_imported_before"] == 0
@@ -668,10 +692,7 @@ def _import_data(
             if state == PromotionOperationState.SUCCEEDED:
                 connection.commit()
                 return json.loads(operation["result_json"])
-            import_marker = connection.execute(
-                "SELECT 1 FROM imported_files WHERE source_hash = ?",
-                (source_hash,),
-            ).fetchone()
+            import_marker = _import_marker_exists(connection, workspace_id, source_hash)
             if import_marker is not None and operation["already_imported_before"] == 0:
                 connection.execute(
                     "UPDATE promotion_operations SET already_imported_before = 1 "
@@ -734,14 +755,7 @@ def _import_data(
                     "for this source."
                 )
 
-        existing_import = connection.execute(
-            """
-            SELECT source_hash
-            FROM imported_files
-            WHERE source_hash = ?
-            """,
-            (source_hash,),
-        ).fetchone()
+        existing_import = _import_marker_exists(connection, workspace_id, source_hash)
 
         if existing_import is not None:
             result = {
@@ -779,29 +793,48 @@ def _import_data(
             "observation": [],
             "maintenance": [],
         }
+        domain_workspace_scoped = _table_has_column(connection, "assets", "workspace_id")
+        if not domain_workspace_scoped and workspace_id != "default":
+            raise ValueError(
+                "This database schema supports imports only in the default workspace; "
+                "apply the current workspace migration before importing elsewhere."
+            )
 
         for asset in data["assets"]:
             external_id = _required_text(asset, "external_id", "Asset")
-
-            cursor = connection.execute(
-                """
+            if domain_workspace_scoped:
+                cursor = connection.execute(
+                    """
                 INSERT INTO assets (
+                    workspace_id,
                     external_id,
                     asset_type,
                     name,
                     description,
-                    location
+                    location,
+                    data_origin
                 )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    external_id,
-                    _required_text(asset, "asset_type", "Asset"),
-                    _required_text(asset, "name", "Asset"),
-                    _optional_text(asset, "description"),
-                    _optional_text(asset, "location"),
-                ),
-            )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workspace_id,
+                        external_id,
+                        _required_text(asset, "asset_type", "Asset"),
+                        _required_text(asset, "name", "Asset"),
+                        _optional_text(asset, "description"),
+                        _optional_text(asset, "location"),
+                        asset.get("data_origin", "unknown"),
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO assets(
+                        external_id, asset_type, name, description, location
+                    ) VALUES (?, ?, ?, ?, ?)""",
+                    (external_id, _required_text(asset, "asset_type", "Asset"),
+                     _required_text(asset, "name", "Asset"),
+                     _optional_text(asset, "description"), _optional_text(asset, "location")),
+                )
 
             asset_map[external_id] = cursor.lastrowid
             inserted_record_ids["asset"].append(cursor.lastrowid)
@@ -810,9 +843,11 @@ def _import_data(
             inspection_key = inspection["inspection_key"].strip()
             asset_external_id = inspection["asset_external_id"].strip()
 
-            cursor = connection.execute(
+            if domain_workspace_scoped:
+                cursor = connection.execute(
                 """
                 INSERT INTO inspections (
+                    workspace_id,
                     asset_id,
                     inspected_at,
                     inspection_method,
@@ -821,18 +856,30 @@ def _import_data(
                     status,
                     notes
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    asset_map[asset_external_id],
-                    inspection["inspected_at"].strip(),
-                    inspection["inspection_method"].strip(),
-                    inspection["data_source"].strip(),
-                    inspection["data_origin"].strip(),
-                    inspection["status"].strip(),
-                    _optional_text(inspection, "notes"),
-                ),
-            )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workspace_id,
+                        asset_map[asset_external_id],
+                        inspection["inspected_at"].strip(),
+                        inspection["inspection_method"].strip(),
+                        inspection["data_source"].strip(),
+                        inspection["data_origin"].strip(),
+                        inspection["status"].strip(),
+                        _optional_text(inspection, "notes"),
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO inspections(
+                        asset_id, inspected_at, inspection_method, data_source,
+                        data_origin, status, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (asset_map[asset_external_id], inspection["inspected_at"].strip(),
+                     inspection["inspection_method"].strip(), inspection["data_source"].strip(),
+                     inspection["data_origin"].strip(), inspection["status"].strip(),
+                     _optional_text(inspection, "notes")),
+                )
 
             inspection_map[inspection_key] = cursor.lastrowid
             inserted_record_ids["inspection"].append(cursor.lastrowid)
@@ -845,9 +892,11 @@ def _import_data(
                 else None
             )
 
-            cursor = connection.execute(
-                """
+            if domain_workspace_scoped:
+                cursor = connection.execute(
+                    """
                 INSERT INTO observations (
+                    workspace_id,
                     inspection_id,
                     observation_type,
                     value,
@@ -856,24 +905,39 @@ def _import_data(
                     data_quality,
                     source_reference
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    inspection_map[observation["inspection_key"].strip()],
-                    observation["observation_type"].strip(),
-                    value,
-                    _optional_text(observation, "unit"),
-                    _optional_text(observation, "finding"),
-                    observation["data_quality"].strip(),
-                    _optional_text(observation, "source_reference"),
-                ),
-            )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workspace_id,
+                        inspection_map[observation["inspection_key"].strip()],
+                        observation["observation_type"].strip(),
+                        value,
+                        _optional_text(observation, "unit"),
+                        _optional_text(observation, "finding"),
+                        observation["data_quality"].strip(),
+                        _optional_text(observation, "source_reference"),
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO observations(
+                        inspection_id, observation_type, value, unit, finding,
+                        data_quality, source_reference
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (inspection_map[observation["inspection_key"].strip()],
+                     observation["observation_type"].strip(), value,
+                     _optional_text(observation, "unit"), _optional_text(observation, "finding"),
+                     observation["data_quality"].strip(),
+                     _optional_text(observation, "source_reference")),
+                )
             inserted_record_ids["observation"].append(cursor.lastrowid)
 
         for maintenance in data["maintenance"]:
-            cursor = connection.execute(
-                """
+            if domain_workspace_scoped:
+                cursor = connection.execute(
+                    """
                 INSERT INTO maintenance_records (
+                    workspace_id,
                     asset_id,
                     performed_at,
                     maintenance_type,
@@ -881,26 +945,31 @@ def _import_data(
                     performed_by,
                     data_origin
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    asset_map[maintenance["asset_external_id"].strip()],
-                    maintenance["performed_at"].strip(),
-                    maintenance["maintenance_type"].strip(),
-                    maintenance["description"].strip(),
-                    _optional_text(maintenance, "performed_by"),
-                    maintenance["data_origin"].strip(),
-                ),
-            )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        workspace_id,
+                        asset_map[maintenance["asset_external_id"].strip()],
+                        maintenance["performed_at"].strip(),
+                        maintenance["maintenance_type"].strip(),
+                        maintenance["description"].strip(),
+                        _optional_text(maintenance, "performed_by"),
+                        maintenance["data_origin"].strip(),
+                    ),
+                )
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO maintenance_records(
+                        asset_id, performed_at, maintenance_type, description, performed_by, data_origin
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (asset_map[maintenance["asset_external_id"].strip()],
+                     maintenance["performed_at"].strip(), maintenance["maintenance_type"].strip(),
+                     maintenance["description"].strip(), _optional_text(maintenance, "performed_by"),
+                     maintenance["data_origin"].strip()),
+                )
             inserted_record_ids["maintenance"].append(cursor.lastrowid)
 
-        connection.execute(
-            """
-            INSERT INTO imported_files (source_hash, source_name)
-            VALUES (?, ?)
-            """,
-            (source_hash, source_name),
-        )
+        _insert_import_marker(connection, workspace_id, source_hash, source_name)
 
         result = {
             "status": "imported",
@@ -939,3 +1008,43 @@ def _import_data(
         connection.commit()
 
     return result
+
+
+def _table_has_column(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(row["name"] == column for row in connection.execute(f"PRAGMA table_info({table})"))
+
+
+def _import_marker_exists(connection: sqlite3.Connection, workspace_id: str, source_hash: str):
+    if _table_has_column(connection, "imported_files", "workspace_id"):
+        return connection.execute(
+            "SELECT 1 FROM imported_files WHERE workspace_id = ? AND source_hash = ?",
+            (workspace_id, source_hash),
+        ).fetchone()
+    if workspace_id != "default":
+        raise ValueError(
+            "This database schema supports imports only in the default workspace; "
+            "apply the current workspace migration before importing elsewhere."
+        )
+    return connection.execute(
+        "SELECT 1 FROM imported_files WHERE source_hash = ?", (source_hash,)
+    ).fetchone()
+
+
+def _insert_import_marker(
+    connection: sqlite3.Connection, workspace_id: str, source_hash: str, source_name: str
+) -> None:
+    if _table_has_column(connection, "imported_files", "workspace_id"):
+        connection.execute(
+            "INSERT INTO imported_files(workspace_id, source_hash, source_name) VALUES (?, ?, ?)",
+            (workspace_id, source_hash, source_name),
+        )
+        return
+    if workspace_id != "default":
+        raise ValueError(
+            "This database schema supports imports only in the default workspace; "
+            "apply the current workspace migration before importing elsewhere."
+        )
+    connection.execute(
+        "INSERT INTO imported_files(source_hash, source_name) VALUES (?, ?)",
+        (source_hash, source_name),
+    )

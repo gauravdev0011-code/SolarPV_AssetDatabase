@@ -16,6 +16,8 @@ def create_maintenance_record(
     performed_by: str | None = None,
     data_origin: str = "unknown",
     database_path: str | Path = DEFAULT_DATABASE,
+    *,
+    workspace_id: str = "default",
 ) -> int:
     """Create a maintenance record and return its ID."""
     if not performed_at or not performed_at.strip():
@@ -34,6 +36,7 @@ def create_maintenance_record(
         cursor = connection.execute(
             """
             INSERT INTO maintenance_records (
+                workspace_id,
                 asset_id,
                 performed_at,
                 maintenance_type,
@@ -41,9 +44,10 @@ def create_maintenance_record(
                 performed_by,
                 data_origin
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                workspace_id,
                 asset_id,
                 performed_at.strip(),
                 maintenance_type.strip(),
@@ -59,6 +63,8 @@ def create_maintenance_record(
 def get_maintenance_record(
     maintenance_id: int,
     database_path: str | Path = DEFAULT_DATABASE,
+    *,
+    workspace_id: str = "default",
 ) -> dict | None:
     """Retrieve one maintenance record by ID."""
     with get_connection(database_path) as connection:
@@ -66,9 +72,9 @@ def get_maintenance_record(
             """
             SELECT *
             FROM maintenance_records
-            WHERE maintenance_id = ?
+            WHERE maintenance_id = ? AND workspace_id = ?
             """,
-            (maintenance_id,),
+            (maintenance_id, workspace_id),
         ).fetchone()
 
         return dict(row) if row else None
@@ -77,6 +83,8 @@ def get_maintenance_record(
 def list_maintenance_records(
     asset_id: int,
     database_path: str | Path = DEFAULT_DATABASE,
+    *,
+    workspace_id: str = "default",
 ) -> list[dict]:
     """List an asset's maintenance history, newest first."""
     with get_connection(database_path) as connection:
@@ -84,10 +92,10 @@ def list_maintenance_records(
             """
             SELECT *
             FROM maintenance_records
-            WHERE asset_id = ?
+            WHERE asset_id = ? AND workspace_id = ?
             ORDER BY performed_at DESC, maintenance_id DESC
             """,
-            (asset_id,),
+            (asset_id, workspace_id),
         ).fetchall()
 
         return [dict(row) for row in rows]
